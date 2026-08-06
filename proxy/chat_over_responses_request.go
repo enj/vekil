@@ -28,6 +28,10 @@ type responsesChatRequestOptions struct {
 	ReplayRoute         responsesChatReplayRoute
 	MinimumOutputTokens int
 	DropSamplingParams  bool
+	// CarriedReasoning holds the Responses output items the client replayed,
+	// keyed by assistant tool-call id. Preferred over ReplayStore: it cannot
+	// expire, cannot be evicted, and survives a restart.
+	CarriedReasoning map[string][]json.RawMessage
 }
 
 type responsesChatRequestPlan struct {
@@ -343,6 +347,47 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			}
 			if replayCalls != 0 && replayCalls != len(projected) {
 				return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
+			}
+			// Preferred path: the client replayed this turn's Responses output
+			// items in a thinking block, so no lookup is needed and nothing can
+			// have expired. Requires every projected call to be covered — a
+			// partially-carried turn would send Copilot a reasoning chain that
+			// does not match the calls beside it.
+			if carried, ok := carriedItemsForCalls(options.CarriedReasoning, projected); ok {
+				if _, duplicate := restoredGroups[carriedReasoningGroupID]; duplicate {
+					return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
+				}
+				matchedResults := 0
+				for _, projectedCall := range projected {
+					if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
+						matchedResults++
+					}
+				}
+				if matchedResults == 0 {
+					return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
+				}
+				if matchedResults == len(projected) {
+					input = append(input, cloneReplayRawMessages(carried)...)
+				} else {
+					// Copilot rejects a complete parallel group when only a subset
+					// has outputs; replay the visible text plus the answered calls.
+					if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
+						input = appendAssistantHistoryMessage(input, assistantText)
+					}
+					for callIndex, projectedCall := range projected {
+						if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
+							continue
+						}
+						input = append(input, syntheticItems[callIndex])
+					}
+				}
+				for _, projectedCall := range projected {
+					if _, duplicate := calls[projectedCall.ID]; duplicate {
+						return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls", index), "duplicate tool call ID")
+					}
+					calls[projectedCall.ID] = projectedCall.ID
+				}
+				continue
 			}
 			if replayCalls == 0 {
 				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {

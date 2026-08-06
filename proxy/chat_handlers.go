@@ -1592,7 +1592,13 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	publicModel := explicitRoutePublicModel(route, req.Model)
 	responseReq := req
 	responseReq.Model = publicModel
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{}, providerModel)
+	// Reasoning items the client replayed in thinking blocks. Extracted from
+	// the Anthropic request rather than threaded out of
+	// prepareAnthropicChatCompletionsRequest…, which builds the Chat body and
+	// has no business carrying transport state.
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{
+		CarriedReasoning: extractCarriedReasoning(req.Messages),
+	}, providerModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return

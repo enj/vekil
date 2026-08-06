@@ -190,3 +190,46 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) map[string][]js
 	}
 	return carried
 }
+
+// carriedReasoningGroupID marks a turn restored from a client-carried
+// signature rather than the store. The store uses uint64 group ids to reject a
+// group appearing twice in one request; carried turns need the same guard but
+// have no store id, so they share this sentinel.
+const carriedReasoningGroupID uint64 = 0
+
+// carriedItemsForCalls returns the carried output items covering EVERY
+// projected call in an assistant turn.
+//
+// All-or-nothing on purpose. A partially-carried turn would hand Copilot a
+// reasoning chain that does not match the calls beside it, which is worse than
+// having no chain at all: better to fall through and synthesise the whole turn
+// consistently.
+//
+// Also requires every call to resolve to the SAME items. Calls from one
+// assistant message share one output array, so a mismatch means the client
+// stitched turns together and the carrier can no longer be trusted.
+func carriedItemsForCalls(carried map[string][]json.RawMessage, projected []responsesChatReplayProjectedCall) ([]json.RawMessage, bool) {
+	if len(carried) == 0 || len(projected) == 0 {
+		return nil, false
+	}
+	var items []json.RawMessage
+	for _, call := range projected {
+		found, ok := carried[call.ID]
+		if !ok || len(found) == 0 {
+			return nil, false
+		}
+		if items == nil {
+			items = found
+			continue
+		}
+		if len(items) != len(found) {
+			return nil, false
+		}
+		for i := range items {
+			if string(items[i]) != string(found[i]) {
+				return nil, false
+			}
+		}
+	}
+	return items, true
+}

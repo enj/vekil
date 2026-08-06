@@ -38,6 +38,20 @@ type chatExecutionOptions struct {
 	ResponsesMinimumOutputTokens int
 	ResponsesDropSamplingParams  bool
 	ResponsesUsageOnly           bool
+	// CarriedReasoning maps an assistant tool-call id to the Responses output
+	// items the client replayed for that turn (see reasoning_carrier.go).
+	//
+	// This is how reasoning survives without server-side state. It is an
+	// in-process field on purpose: the Chat body between the Anthropic and
+	// Responses hops is serialised bytes, so a json:"-" field on
+	// models.OpenAIMessage would be dropped at marshal, whereas this struct
+	// is already threaded along the exact path the items need and is never
+	// serialised.
+	//
+	// nil for requests that carry nothing — legacy transcripts, clients that
+	// drop thinking blocks, or the native Chat surface, which has nowhere to
+	// put a carrier. Those degrade rather than fail.
+	CarriedReasoning map[string][]json.RawMessage
 }
 
 type chatExecutionResult struct {
@@ -177,6 +191,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		ReplayRoute:         replayRoute,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
+		CarriedReasoning:    options.CarriedReasoning,
 	})
 	if err != nil {
 		return chatExecutionResult{}, err
