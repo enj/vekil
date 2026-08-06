@@ -23,7 +23,7 @@ func newChatInvalidRequest(param, message string) *chatExecutionError {
 
 type responsesChatRequestOptions struct {
 	UpstreamModel       string
-	ReplayRoute         responsesChatReplayRoute
+	Route               responsesChatRoute
 	MinimumOutputTokens int
 	DropSamplingParams  bool
 	// CarriedReasoning holds the Responses output items the client replayed,
@@ -319,9 +319,9 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				continue
 			}
 
-			projected := make([]responsesChatReplayProjectedCall, len(message.ToolCalls))
+			projected := make([]responsesChatProjectedCall, len(message.ToolCalls))
 			syntheticItems := make([]json.RawMessage, len(message.ToolCalls))
-			replayCalls := 0
+			legacyCalls := 0
 			for callIndex, callRaw := range message.ToolCalls {
 				callID, item, err := translateSyntheticChatToolCall(callRaw, index, callIndex)
 				if err != nil {
@@ -334,17 +334,17 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 					} `json:"function"`
 				}
 				_ = json.Unmarshal(callRaw, &parsed)
-				projected[callIndex] = responsesChatReplayProjectedCall{ID: callID, Name: strings.TrimSpace(parsed.Function.Name), Arguments: parsed.Function.Arguments}
+				projected[callIndex] = responsesChatProjectedCall{ID: callID, Name: strings.TrimSpace(parsed.Function.Name), Arguments: parsed.Function.Arguments}
 				syntheticItems[callIndex] = item
-				if isResponsesChatReplayCallID(callID) {
-					replayCalls++
+				if isLegacyProxyCallID(callID) {
+					legacyCalls++
 				}
 			}
-			if replayCalls > 0 && refusal != "" {
+			if legacyCalls > 0 && refusal != "" {
 				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].refusal", index), "refusal is not supported on Responses replay tool-call messages")
 			}
-			if replayCalls != 0 && replayCalls != len(projected) {
-				return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
+			if legacyCalls != 0 && legacyCalls != len(projected) {
+				return nil, responsesChatRequestError(legacyProxyCallIDMixedCode, legacyProxyCallIDMixedMessage)
 			}
 			// Preferred path: the client replayed this turn's Responses output
 			// items in a thinking block, so no lookup is needed and nothing can
@@ -353,7 +353,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			// does not match the calls beside it.
 			if carried, ok := carriedItemsForCalls(options.CarriedReasoning, projected); ok {
 				if _, duplicate := restoredGroups[carriedReasoningGroupID]; duplicate {
-					return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
+					return nil, responsesChatRequestError(legacyProxyCallIDProjectionCode, "Responses replay group appears more than once in the request.")
 				}
 				matchedResults := 0
 				for _, projectedCall := range projected {
@@ -365,7 +365,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 					return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
 				}
 				if matchedResults == len(projected) {
-					input = append(input, cloneReplayRawMessages(carried)...)
+					input = append(input, cloneRawMessages(carried)...)
 				} else {
 					// Copilot rejects a complete parallel group when only a subset
 					// has outputs; replay the visible text plus the answered calls.
@@ -387,7 +387,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				}
 				continue
 			}
-			if replayCalls == 0 {
+			if legacyCalls == 0 {
 				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
 					input = appendAssistantHistoryMessage(input, assistantText)
 				}
@@ -465,8 +465,8 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			}
 			upstreamCallID, ok := calls[callID]
 			if !ok {
-				if isResponsesChatReplayCallID(callID) {
-					return nil, missingResponsesChatReplayError()
+				if isLegacyProxyCallID(callID) {
+					return nil, legacyProxyCallIDRoutingError()
 				}
 				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_call_id", index), "tool result references no prior assistant tool call")
 			}
@@ -513,7 +513,7 @@ func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {
 	return indices, nil
 }
 
-func replayChatExecutionError(code, message string) *chatExecutionError {
+func responsesChatRequestError(code, message string) *chatExecutionError {
 	return &chatExecutionError{StatusCode: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Param: "messages", Message: message}
 }
 
@@ -544,12 +544,12 @@ func appendAssistantHistoryMessage(input []json.RawMessage, text string) []json.
 	return append(input, item)
 }
 
-func isResponsesChatReplayCallID(id string) bool {
+func isLegacyProxyCallID(id string) bool {
 	id = strings.TrimSpace(id)
-	if len(id) != responsesChatReplayIDLength || !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
+	if len(id) != legacyProxyCallIDLength || !strings.HasPrefix(id, legacyProxyCallIDPrefix) {
 		return false
 	}
-	for _, char := range id[len(responsesChatReplayCallIDPrefix):] {
+	for _, char := range id[len(legacyProxyCallIDPrefix):] {
 		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
 			continue
 		}
@@ -667,7 +667,7 @@ func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error
 	return string(encoded), nil
 }
 
-func missingResponsesChatReplayError() *chatExecutionError {
+func legacyProxyCallIDRoutingError() *chatExecutionError {
 	return &chatExecutionError{
 		StatusCode: http.StatusBadRequest,
 		Type:       "invalid_request_error",

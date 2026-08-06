@@ -208,7 +208,7 @@ const carriedReasoningGroupID uint64 = 0
 // Also requires every call to resolve to the SAME items. Calls from one
 // assistant message share one output array, so a mismatch means the client
 // stitched turns together and the carrier can no longer be trusted.
-func carriedItemsForCalls(carried map[string][]json.RawMessage, projected []responsesChatReplayProjectedCall) ([]json.RawMessage, bool) {
+func carriedItemsForCalls(carried map[string][]json.RawMessage, projected []responsesChatProjectedCall) ([]json.RawMessage, bool) {
 	if len(carried) == 0 || len(projected) == 0 {
 		return nil, false
 	}

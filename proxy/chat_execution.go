@@ -76,9 +76,9 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
-	if chatRequestContainsResponsesReplayID(chatBody) && route.backend != chatBackendResponses {
+	if chatRequestContainsLegacyProxyCallID(chatBody) && route.backend != chatBackendResponses {
 		if !chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-			replayErr := missingResponsesChatReplayError()
+			replayErr := legacyProxyCallIDRoutingError()
 			attachChatExecutionErrorRoute(replayErr, route)
 			return chatExecutionResult{}, replayErr
 		}
@@ -109,7 +109,7 @@ func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []
 	return matches
 }
 
-func chatRequestContainsResponsesReplayID(body []byte) bool {
+func chatRequestContainsLegacyProxyCallID(body []byte) bool {
 	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
@@ -133,7 +133,7 @@ func chatRequestContainsResponsesReplayID(body []byte) bool {
 				case "tool":
 					for _, rawCallID := range rawJSONFieldsExactOrFold(message, "tool_call_id") {
 						var callID string
-						if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+						if json.Unmarshal(rawCallID, &callID) == nil && isLegacyProxyCallID(callID) {
 							return true
 						}
 					}
@@ -150,7 +150,7 @@ func chatRequestContainsResponsesReplayID(body []byte) bool {
 							}
 							for _, rawCallID := range rawJSONFieldsExactOrFold(call, "id") {
 								var callID string
-								if json.Unmarshal(rawCallID, &callID) == nil && isResponsesChatReplayCallID(callID) {
+								if json.Unmarshal(rawCallID, &callID) == nil && isLegacyProxyCallID(callID) {
 									return true
 								}
 							}
@@ -184,14 +184,14 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 }
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
-	replayRoute := responsesChatReplayRoute{
+	replayRoute := responsesChatRoute{
 		ProviderID:    route.provider.id,
 		PublicModel:   route.publicModel,
 		UpstreamModel: route.upstreamModel,
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
-		ReplayRoute:         replayRoute,
+		Route:               replayRoute,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
 		CarriedReasoning:    options.CarriedReasoning,
@@ -237,7 +237,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	if plan.Stream {
 		stream, streamErr := translateResponsesSSEToChat(ctx, resp.Body, responsesChatResponseOptions{
 			PublicModel: route.publicModel,
-			ReplayRoute: replayRoute,
+			Route:       replayRoute,
 		})
 		if streamErr != nil {
 			attachChatExecutionErrorHeaders(streamErr, result.Headers)
@@ -259,7 +259,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	converted, err := translateResponsesJSONToChat(responseBody, responsesChatResponseOptions{
 		PublicModel: route.publicModel,
-		ReplayRoute: replayRoute,
+		Route:       replayRoute,
 		UsageOnly:   options.ResponsesUsageOnly,
 	})
 	if err != nil {

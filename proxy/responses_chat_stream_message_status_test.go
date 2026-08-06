@@ -325,7 +325,7 @@ func TestResponsesChatStreamValidatesTerminalReasoningStatus(t *testing.T) {
 func TestResponsesChatStreamInvalidReasoningStatusDoesNotPublishReplay(t *testing.T) {
 	state := newResponsesChatStreamState(responsesChatStreamConfig{
 		PublicModel: "gpt-public",
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		Now:         time.Now,
 	})
 	mustHandleResponsesChatStatusTransition(t, state.handleCreated, map[string]any{
@@ -451,7 +451,7 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			state := newResponsesChatStreamState(responsesChatStreamConfig{
 				PublicModel: "gpt-public",
-				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+				Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 				Now:         time.Now,
 			})
 			mustHandleResponsesChatStatusTransition(t, state.handleCreated, map[string]any{

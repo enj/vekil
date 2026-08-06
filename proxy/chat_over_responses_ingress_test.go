@@ -120,7 +120,7 @@ func TestHandleOpenAIChatCompletionsResponsesBackedForcedStreamToolCall(t *testi
 	call := response.Choices[0].Message.ToolCalls[0]
 	// Copilot's own call id passes through now; proxy ids existed only to
 	// key the replay store, and the turn is carried by the client instead.
-	if strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) {
+	if strings.HasPrefix(call.ID, legacyProxyCallIDPrefix) {
 		t.Fatalf("call = %#v", call)
 	}
 }

@@ -169,7 +169,7 @@ func TestTranslateResponsesJSONToChatInvalidReasoningStatusDoesNotPublishReplay(
 
 	_, err = translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
@@ -227,7 +227,7 @@ func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
 			}
 			result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt-public",
-				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+				Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 			})
 			if tt.wantError {
 				var executionErr *chatExecutionError

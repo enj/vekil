@@ -35,60 +35,50 @@ package proxy
 // would touch seven files and was kept out of the deletion to keep this diff
 // reviewable.
 
-import (
-	"encoding/json"
-)
+import ()
 
 const (
-	// responsesChatReplayCallIDPrefix is no longer minted, only detected: a
+	// legacyProxyCallIDPrefix is no longer minted, only detected: a
 	// client transcript can still hold ids from before the carrier existed.
-	responsesChatReplayCallIDPrefix = "call_vekil_"
+	legacyProxyCallIDPrefix = "call_vekil_"
 
-	responsesChatReplayIDLength = len(responsesChatReplayCallIDPrefix) + 22
+	legacyProxyCallIDLength = len(legacyProxyCallIDPrefix) + 22
 )
 
 const (
-	responsesChatReplayMissingCode    = "responses_replay_state_missing"
-	responsesChatReplayMixedCode      = "responses_replay_group_mismatch"
-	responsesChatReplayProjectionCode = "responses_replay_projection_mismatch"
+	legacyProxyCallIDMissingCode    = "responses_replay_state_missing"
+	legacyProxyCallIDMixedCode      = "responses_replay_group_mismatch"
+	legacyProxyCallIDProjectionCode = "responses_replay_projection_mismatch"
 )
 
 const (
-	responsesChatReplayMixedMessage = "Assistant tool calls reference multiple Responses replay groups."
+	legacyProxyCallIDMixedMessage = "Assistant tool calls reference multiple Responses replay groups."
 )
 
-// responsesChatReplayRoute identifies which provider/model a turn belongs to.
+// responsesChatRoute identifies which provider/model a turn belongs to.
 // Kept because routing still needs it; it never had anything to do with the
 // store's lifetime.
-type responsesChatReplayRoute struct {
+type responsesChatRoute struct {
 	ProviderID    string
 	PublicModel   string
 	UpstreamModel string
 }
 
-func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
+func (r responsesChatRoute) equal(other responsesChatRoute) bool {
 	return r.ProviderID == other.ProviderID &&
 		r.PublicModel == other.PublicModel &&
 		r.UpstreamModel == other.UpstreamModel
 }
 
-// responsesChatReplayProjectedCall is one tool call as the client presented it.
+// responsesChatProjectedCall is one tool call as the client presented it.
 // The carrier keys on these ids (see carriedItemsForCalls).
-type responsesChatReplayProjectedCall struct {
+type responsesChatProjectedCall struct {
 	ID        string
 	Name      string
 	Arguments string
 }
 
-// cloneReplayRawMessages copies items before they are handed to a request
-// envelope, so a later mutation cannot reach the caller's slice.
-func cloneReplayRawMessages(items []json.RawMessage) []json.RawMessage {
-	if len(items) == 0 {
-		return nil
-	}
-	cloned := make([]json.RawMessage, len(items))
-	for i, item := range items {
-		cloned[i] = append(json.RawMessage(nil), item...)
-	}
-	return cloned
-}
+// (cloneRawMessages lived here as a near-duplicate of the identical helper in
+// responses_websocket.go -- same semantics, same append-into-nil clone. The
+// rename collided with it and exposed the duplication, so this copy is gone
+// and callers use the existing one.)

@@ -581,11 +581,11 @@ func explicitChatExecutionEndpoint(route *modelRoute, body []byte) (string, erro
 	if route == nil || route.legacy {
 		return "", nil
 	}
-	if chatRequestContainsResponsesReplayID(body) {
+	if chatRequestContainsLegacyProxyCallID(body) {
 		if explicitRouteHasChatBackend(route, providerEndpointResponses) {
 			return providerEndpointResponses, nil
 		}
-		return "", missingResponsesChatReplayError()
+		return "", legacyProxyCallIDRoutingError()
 	}
 	if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) {
 		return providerEndpointChatCompletions, nil
@@ -739,15 +739,15 @@ func convertedExplicitChatSafeHeaders(resp *http.Response, publicModel string) h
 	return headers
 }
 
-func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) responsesChatReplayRoute {
+func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) responsesChatRoute {
 	if route == nil || target.provider == nil {
-		return responsesChatReplayRoute{}
+		return responsesChatRoute{}
 	}
 	upstreamModel := strings.TrimSpace(target.upstreamModel)
 	if upstreamModel == "" {
 		upstreamModel = strings.TrimSpace(route.public.id)
 	}
-	return responsesChatReplayRoute{
+	return responsesChatRoute{
 		ProviderID:    target.provider.id,
 		PublicModel:   route.public.id,
 		UpstreamModel: upstreamModel,
@@ -756,20 +756,20 @@ func explicitResponsesChatReplayRoute(route *modelRoute, target targetBinding) r
 
 func isMissingResponsesChatReplayError(err error) bool {
 	var executionErr *chatExecutionError
-	return errors.As(err, &executionErr) && executionErr.Code == responsesChatReplayMissingCode
+	return errors.As(err, &executionErr) && executionErr.Code == legacyProxyCallIDMissingCode
 }
 
 func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions) (responsesChatRequestPlan, targetBinding, error) {
 	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
-			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
+			Route:               explicitResponsesChatReplayRoute(route, target),
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
 		})
 	}
 
-	if !chatRequestContainsResponsesReplayID(chatBody) {
+	if !chatRequestContainsLegacyProxyCallID(chatBody) {
 		target, _ := route.primaryTarget()
 		plan, err := translateForTarget(target)
 		return plan, target, err
@@ -806,7 +806,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		return responsesChatRequestPlan{}, target, err
 	}
 	if missing == nil {
-		missing = missingResponsesChatReplayError()
+		missing = legacyProxyCallIDRoutingError()
 	}
 	return responsesChatRequestPlan{}, targetBinding{}, missing
 }
@@ -851,7 +851,7 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 
 	responseOptions := responsesChatResponseOptions{
 		PublicModel: route.public.id,
-		ReplayRoute: explicitResponsesChatReplayRoute(route, target),
+		Route:       explicitResponsesChatReplayRoute(route, target),
 		UsageOnly:   options.ResponsesUsageOnly,
 	}
 	if plan.Stream {
@@ -893,9 +893,9 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
-	if chatRequestContainsResponsesReplayID(body) && route.backend != chatBackendResponses {
+	if chatRequestContainsLegacyProxyCallID(body) && route.backend != chatBackendResponses {
 		if !chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-			replayErr := missingResponsesChatReplayError()
+			replayErr := legacyProxyCallIDRoutingError()
 			attachChatExecutionErrorRoute(replayErr, route)
 			return chatExecutionResult{}, replayErr
 		}

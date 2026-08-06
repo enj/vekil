@@ -44,10 +44,10 @@ func TestTranslateResponsesJSONToChatPublishesFunctionCallReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	route := responsesChatRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayRoute: route,
+		Route:       route,
 	})
 	if err != nil {
 		t.Fatalf("translateResponsesJSONToChat() error = %v", err)
@@ -104,7 +104,7 @@ func TestTranslateResponsesJSONToChatOutputMatrix(t *testing.T) {
 		}
 		result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 			PublicModel: "gpt-public",
-			ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+			Route:       responsesChatRoute{ProviderID: "p", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -113,8 +113,8 @@ func TestTranslateResponsesJSONToChatOutputMatrix(t *testing.T) {
 		// Upstream ids pass through now; they must still be distinct, since a
 		// parallel group keys its carrier by each call id.
 		if len(calls) != 2 || calls[0].ID == calls[1].ID ||
-			strings.HasPrefix(calls[0].ID, responsesChatReplayCallIDPrefix) ||
-			strings.HasPrefix(calls[1].ID, responsesChatReplayCallIDPrefix) {
+			strings.HasPrefix(calls[0].ID, legacyProxyCallIDPrefix) ||
+			strings.HasPrefix(calls[1].ID, legacyProxyCallIDPrefix) {
 			t.Fatalf("calls = %#v", calls)
 		}
 	})
@@ -188,7 +188,7 @@ func TestTranslateResponsesJSONToChatUsageOnlyDoesNotPublishReplay(t *testing.T)
 	}
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		UsageOnly:   true,
 	})
 	if err != nil {
@@ -213,7 +213,7 @@ func TestTranslateResponsesJSONToChatRejectsNonterminalToolStatusBeforePublish(t
 	body, _ = json.Marshal(payload)
 	_, err = translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_response_status" {
@@ -237,7 +237,7 @@ func TestTranslateResponsesJSONToChatDoesNotExposeIncompleteFunctionCall(t *test
 	body, _ = json.Marshal(payload)
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestTranslateResponsesJSONToChatDoesNotExposeIncompleteFunctionCall(t *test
 
 func TestTranslateResponsesJSONToChatPreservesOpaqueFunctionArguments(t *testing.T) {
 	body := []byte(`{"id":"resp-opaque","created_at":1700000000,"status":"completed","output":[{"type":"function_call","id":"item","call_id":"upstream-call","name":"f","arguments":"{not-json","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
-	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{PublicModel: "gpt", ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
+	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{PublicModel: "gpt", Route: responsesChatRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestResponsesChatCodeOnlyFailuresAreClassified(t *testing.T) {
 
 func TestTranslateResponsesJSONToChatRejectsRefusalWithToolCalls(t *testing.T) {
 	body := []byte(`{"id":"resp-mixed","created_at":1700000000,"status":"completed","output":[{"type":"message","id":"m","status":"completed","role":"assistant","content":[{"type":"refusal","refusal":"no"}]},{"type":"function_call","id":"f","call_id":"call","name":"tool","arguments":"{}","status":"completed"}]}`)
-	_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
+	_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{Route: responsesChatRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway {
 		t.Fatalf("error = %#v", err)
@@ -328,7 +328,7 @@ func TestTranslateResponsesJSONToChatRetainsUsageWhenReplayPublishFails(t *testi
 	// The surviving obligation is that a successful turn reports usage AND
 	// hands back something for the client to carry.
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"},
+		Route: responsesChatRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"},
 	})
 	if err != nil {
 		t.Fatalf("a store limit must no longer be able to fail a turn: %v", err)

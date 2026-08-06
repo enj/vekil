@@ -32,7 +32,7 @@ const (
 
 type responsesChatStreamConfig struct {
 	PublicModel string
-	ReplayRoute responsesChatReplayRoute
+	Route       responsesChatRoute
 
 	PrecommitTimeout  time.Duration
 	PrecommitMaxBytes int
@@ -81,7 +81,7 @@ func (c *responsesChatStreamControl) closeBody() {
 func translateResponsesSSEToChat(ctx context.Context, body io.ReadCloser, options responsesChatResponseOptions) (*chatStreamEventStream, error) {
 	return prepareResponsesChatStream(ctx, body, responsesChatStreamConfig{
 		PublicModel: options.PublicModel,
-		ReplayRoute: options.ReplayRoute,
+		Route:       options.Route,
 	})
 }
 
@@ -371,7 +371,7 @@ type responsesChatStreamState struct {
 	reasoningStatusByIndex map[int]string
 	tools                  []*responsesChatToolState
 	toolsByIndex           map[int]*responsesChatToolState
-	replayBytes            int
+	streamBytes            int
 	hasIncompleteTool      bool
 	contentParts           int
 	visibleBytes           int
@@ -667,7 +667,7 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output",
 			"Responses stream exceeded the per-turn output-item limit")
 	}
-	if err := s.chargeReplayBytes(64); err != nil {
+	if err := s.chargeStreamBytes(64); err != nil {
 		return responsesChatStreamTransition{}, err
 	}
 	if _, exists := s.itemsByIndex[*event.OutputIndex]; exists {
@@ -688,12 +688,12 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "function-call output item is malformed")
 		}
 		if !s.visibleBytesCharged {
-			if err := s.chargeReplayBytes(s.visibleBytes); err != nil {
+			if err := s.chargeStreamBytes(s.visibleBytes); err != nil {
 				return responsesChatStreamTransition{}, err
 			}
 			s.visibleBytesCharged = true
 		}
-		if err := s.chargeReplayBytes(len(event.Item.CallID) + len(event.Item.Name) + len(event.Item.Arguments) + 256); err != nil {
+		if err := s.chargeStreamBytes(len(event.Item.CallID) + len(event.Item.Name) + len(event.Item.Arguments) + 256); err != nil {
 			return responsesChatStreamTransition{}, err
 		}
 		tool := &responsesChatToolState{
@@ -734,7 +734,7 @@ func (s *responsesChatStreamState) handleContentPartAdded(data []byte) (response
 	if s.contentParts >= responsesChatStreamMaxItems {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses stream contains too many content parts")
 	}
-	if err := s.chargeReplayBytes(128 + len(event.Part.Type)); err != nil {
+	if err := s.chargeStreamBytes(128 + len(event.Part.Type)); err != nil {
 		return responsesChatStreamTransition{}, err
 	}
 	s.contentParts++
@@ -777,7 +777,7 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "output text delta correlation is invalid")
 	}
 	if s.visibleBytesCharged {
-		if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
+		if err := s.chargeStreamBytes(len(event.Delta)); err != nil {
 			return responsesChatStreamTransition{}, err
 		}
 	} else if s.visibleBytes <= responsesChatStreamMaxBytes {
@@ -884,7 +884,7 @@ func (s *responsesChatStreamState) handleFunctionArgumentsDelta(data []byte) (re
 	if tool == nil || tool.outputIndex != *event.OutputIndex || tool.argumentsDone || tool.done {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "function argument delta correlation is invalid")
 	}
-	if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
+	if err := s.chargeStreamBytes(len(event.Delta)); err != nil {
 		return responsesChatStreamTransition{}, err
 	}
 	tool.arguments.WriteString(event.Delta)
@@ -909,7 +909,7 @@ func (s *responsesChatStreamState) handleFunctionArgumentsDone(data []byte) (res
 	case event.Arguments == accumulated:
 	case strings.HasPrefix(event.Arguments, accumulated):
 		suffix := event.Arguments[len(accumulated):]
-		if err := s.chargeReplayBytes(len(suffix)); err != nil {
+		if err := s.chargeStreamBytes(len(suffix)); err != nil {
 			return responsesChatStreamTransition{}, err
 		}
 		tool.arguments.WriteString(suffix)
@@ -920,18 +920,18 @@ func (s *responsesChatStreamState) handleFunctionArgumentsDone(data []byte) (res
 	return responsesChatStreamTransition{}, nil
 }
 
-// chargeReplayBytes bounds how much one stream may accumulate.
+// chargeStreamBytes bounds how much one stream may accumulate.
 //
 // These were the replay store's per-group limits. The store is gone, but the
 // guard is not vestigial: it still caps what a single stream can build up from
 // upstream, which a broken or hostile provider could otherwise drive without
 // limit. Renamed constants, same numbers, error no longer store-shaped.
-func (s *responsesChatStreamState) chargeReplayBytes(additional int) error {
-	if additional < 0 || additional > responsesChatStreamMaxBytes-s.replayBytes {
+func (s *responsesChatStreamState) chargeStreamBytes(additional int) error {
+	if additional < 0 || additional > responsesChatStreamMaxBytes-s.streamBytes {
 		return newChatServerError("unsupported_responses_output",
 			"Responses stream exceeded the per-turn byte limit")
 	}
-	s.replayBytes += additional
+	s.streamBytes += additional
 	return nil
 }
 

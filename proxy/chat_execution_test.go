@@ -191,8 +191,8 @@ func TestChatRequestContainsResponsesReplayIDCaseInsensitiveFallback(t *testing.
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := chatRequestContainsResponsesReplayID([]byte(tc.body)); got != tc.want {
-				t.Fatalf("chatRequestContainsResponsesReplayID(%s) = %v, want %v", tc.body, got, tc.want)
+			if got := chatRequestContainsLegacyProxyCallID([]byte(tc.body)); got != tc.want {
+				t.Fatalf("chatRequestContainsLegacyProxyCallID(%s) = %v, want %v", tc.body, got, tc.want)
 			}
 		})
 	}

@@ -165,7 +165,7 @@ func TestResponsesChatStream_ImmediateFailureBeforeCommit(t *testing.T) {
 func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-		PublicModel: "gpt-public", ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		PublicModel: "gpt-public", Route: responsesChatRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		PrecommitTimeout: time.Second,
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T)
 	for i, chunkIndex := range []int{1, 3} {
 		call := chunks[chunkIndex].Choices[0].Delta.ToolCalls[0]
 		if call.Index == nil || *call.Index != i ||
-			strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) || call.ID == "" {
+			strings.HasPrefix(call.ID, legacyProxyCallIDPrefix) || call.ID == "" {
 			t.Fatalf("tool start %d = %#v", i, call)
 		}
 		args := chunks[chunkIndex+1].Choices[0].Delta.ToolCalls[0]

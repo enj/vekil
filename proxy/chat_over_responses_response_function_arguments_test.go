@@ -21,7 +21,7 @@ func TestTranslateResponsesJSONToChatRequiresCompletedFunctionArgumentsString(t 
 			body := []byte(`{"id":"resp-invalid-arguments","status":"completed","output":[{"type":"function_call","call_id":"upstream-call","name":"lookup","status":"completed"` + tt.argumentsField + `}]}`)
 			_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt",
-				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"},
+				Route:       responsesChatRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"},
 			})
 
 			var executionErr *chatExecutionError
@@ -46,10 +46,10 @@ func TestTranslateResponsesJSONToChatPreservesPresentFunctionArgumentsStrings(t 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := []byte(`{"id":"resp-valid-arguments","status":"completed","output":[{"type":"function_call","call_id":"upstream-call","name":"lookup","arguments":` + tt.argumentsJSON + `,"status":"completed"}]}`)
-			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"}
+			route := responsesChatRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"}
 			result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt",
-				ReplayRoute: route,
+				Route:       route,
 			})
 			if err != nil {
 				t.Fatalf("translateResponsesJSONToChat() error = %v", err)

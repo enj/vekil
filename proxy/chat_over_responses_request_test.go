@@ -344,8 +344,8 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	first, err := translateResponsesJSONToChat(fixture, responsesChatResponseOptions{PublicModel: "gpt-public", ReplayRoute: route})
+	route := responsesChatRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	first, err := translateResponsesJSONToChat(fixture, responsesChatResponseOptions{PublicModel: "gpt-public", Route: route})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 			},
 		}
 		body, _ := json.Marshal(request)
-		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayRoute: route})
+		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", Route: route})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -388,7 +388,7 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 			},
 		}
 		body, _ := json.Marshal(request)
-		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayRoute: route})
+		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", Route: route})
 		if err != nil {
 			t.Fatal(err)
 		}

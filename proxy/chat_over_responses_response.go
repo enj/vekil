@@ -16,7 +16,7 @@ const responsesChatMaxJSONBodyBytes = 16 << 20
 
 type responsesChatResponseOptions struct {
 	PublicModel string
-	ReplayRoute responsesChatReplayRoute
+	Route       responsesChatRoute
 	UsageOnly   bool
 }
 

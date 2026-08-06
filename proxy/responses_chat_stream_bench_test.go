@@ -37,12 +37,12 @@ func benchmarkResponsesChatStream(b *testing.B, fixture []byte, withReplay bool)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(fixture)))
 	ctx := context.Background()
-	route := responsesChatReplayRoute{ProviderID: "bench-provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	route := responsesChatRoute{ProviderID: "bench-provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 	var chunkCount int
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		stream, err := prepareResponsesChatStream(ctx, io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-			PublicModel: "gpt-public", ReplayRoute: route, PrecommitTimeout: time.Second,
+			PublicModel: "gpt-public", Route: route, PrecommitTimeout: time.Second,
 		})
 		if err != nil {
 			b.Fatal(err)
