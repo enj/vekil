@@ -186,13 +186,16 @@ type responsesChatReplayResolution struct {
 }
 
 type responsesChatReplayStoreStats struct {
-	Groups     int
-	Calls      int
-	TotalBytes int
-	Closed     bool
+	Groups          int
+	Calls           int
+	TotalBytes      int
+	Closed          bool
+	PersistFailures int
+	LastPersistErr  error
 }
 
 type responsesChatReplayStoreOptions struct {
+	PersistDir    string
 	TTL           time.Duration
 	MaxGroups     int
 	MaxGroupBytes int
@@ -264,6 +267,15 @@ type responsesChatReplayStore struct {
 	maxCalls      int
 	now           func() time.Time
 	random        io.Reader
+
+	// persistDir, when non-empty, is a directory backing this LRU with
+	// files that outlive the TTL and the process. Empty keeps the
+	// original memory-only behaviour.
+	persistDir string
+	// Persistence health, surfaced through Stats so the handler can log it.
+	// Never fatal: durability is an optimisation over the in-memory cache.
+	persistErr      error
+	persistFailures int
 }
 
 func newResponsesChatReplayStore() *responsesChatReplayStore {
@@ -296,6 +308,7 @@ func newResponsesChatReplayStoreWithOptions(options responsesChatReplayStoreOpti
 		options.Random = rand.Reader
 	}
 	return &responsesChatReplayStore{
+		persistDir:    options.PersistDir,
 		groups:        make(map[uint64]*responsesChatReplayGroup),
 		callsByID:     make(map[string]responsesChatReplayCallRef),
 		lru:           list.New(),
@@ -392,6 +405,13 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	}
 	s.totalBytes += group.byteSize
 	s.enforceLimitsLocked()
+	// Best-effort durability. A group that cannot be written to disk is still
+	// perfectly usable from memory for the rest of its TTL; failing the
+	// request over a cache-persistence problem would be a worse trade.
+	if err := s.persistGroup(group); err != nil {
+		s.persistErr = err
+		s.persistFailures++
+	}
 
 	return responsesChatReplayPublished{
 		GroupID: groupID,
@@ -446,7 +466,16 @@ func (s *responsesChatReplayStore) Resolve(route responsesChatReplayRoute, proje
 	for _, projectedCall := range projection.Calls {
 		ref, ok := s.callsByID[projectedCall.ID]
 		if !ok {
-			return responsesChatReplayResolution{}, errResponsesChatReplayMissing
+			// Not in memory: expired, evicted, or the process restarted.
+			// Try the durable copy before declaring the turn unrecoverable.
+			restored, err := s.rehydrateLocked(projectedCall.ID)
+			if err != nil || restored == nil {
+				return responsesChatReplayResolution{}, errResponsesChatReplayMissing
+			}
+			ref, ok = s.callsByID[projectedCall.ID]
+			if !ok {
+				return responsesChatReplayResolution{}, errResponsesChatReplayMissing
+			}
 		}
 		candidate := s.groups[ref.groupID]
 		if candidate == nil || !candidate.route.equal(route) {
@@ -490,9 +519,11 @@ func (s *responsesChatReplayStore) Stats() responsesChatReplayStoreStats {
 	}
 	s.expireLocked(s.now())
 	return responsesChatReplayStoreStats{
-		Groups:     len(s.groups),
-		Calls:      len(s.callsByID),
-		TotalBytes: s.totalBytes,
+		Groups:          len(s.groups),
+		Calls:           len(s.callsByID),
+		TotalBytes:      s.totalBytes,
+		PersistFailures: s.persistFailures,
+		LastPersistErr:  s.persistErr,
 	}
 }
 

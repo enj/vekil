@@ -419,22 +419,35 @@ func TestHandleOpenAIChatCompletionsResponsesReplayMissingAfterRestart(t *testin
 	})
 	rec := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+
+	// Unresolvable replay state must NOT wedge the conversation.
+	//
+	// This test previously asserted a 400 with code
+	// responses_replay_state_missing. That behaviour was unrecoverable in
+	// practice: the call_vekil_ ids live in the client transcript forever, so
+	// once the store forgot the group — TTL expiry, LRU eviction, or a restart
+	// like the one this test models — every subsequent request re-resolved the
+	// same ids and re-failed. The session could only be abandoned.
+	//
+	// Now the turn proceeds: the request is forwarded upstream with the tool
+	// calls synthesised from the request itself. The stub upstream here answers
+	// 500, so the only thing worth asserting is that we got past translation
+	// and actually attempted the call.
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("request was rejected instead of degrading: body=%s", rec.Body.String())
 	}
-	if upstreamCalls != 0 {
-		t.Fatalf("upstream calls = %d", upstreamCalls)
+	if upstreamCalls == 0 {
+		t.Fatal("upstream was never called; the turn was dropped rather than degraded")
 	}
 	var response struct {
 		Error struct {
 			Type, Code, Param, Message string
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Error.Type != "invalid_request_error" || response.Error.Code != "responses_replay_state_missing" || response.Error.Param != "messages" || response.Error.Message != "Responses-backed tool state is no longer available; restart the assistant tool-call turn." {
-		t.Fatalf("error = %#v", response.Error)
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err == nil {
+		if response.Error.Code == "responses_replay_state_missing" {
+			t.Fatalf("still surfacing the wedge error: %#v", response.Error)
+		}
 	}
 }
 

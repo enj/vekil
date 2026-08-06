@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -598,6 +600,34 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 	return nil
 }
 
+// resolveResponsesReplayDir picks where durable Responses replay records live.
+//
+// Defaults to <token-dir>/responses-replay so it inherits the token dir's
+// 0700 ownership and lifecycle. RESPONSES_REPLAY_DIR overrides it; setting
+// that to "off" disables persistence and restores the stock memory-only
+// behaviour, where a restart or a one-hour gap wedges any conversation
+// holding call_vekil_ ids.
+func resolveResponsesReplayDir(tokenDir string) string {
+	if override := strings.TrimSpace(getEnv("RESPONSES_REPLAY_DIR", "")); override != "" {
+		if strings.EqualFold(override, "off") {
+			return ""
+		}
+		return override
+	}
+	dir := strings.TrimSpace(tokenDir)
+	if dir == "" {
+		dir = "~/.config/vekil"
+	}
+	if strings.HasPrefix(dir, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, dir[1:])
+	}
+	return filepath.Join(dir, "responses-replay")
+}
+
 func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
@@ -632,6 +662,7 @@ func runServe() {
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
+			proxy.WithResponsesReplayPersistDir(resolveResponsesReplayDir(*serve.tokenDir)),
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),

@@ -28,6 +28,11 @@ type responsesChatRequestOptions struct {
 	ReplayRoute         responsesChatReplayRoute
 	MinimumOutputTokens int
 	DropSamplingParams  bool
+	// DegradedReplays, when non-nil, is incremented once per assistant
+	// message whose stored Responses replay group was unavailable and had
+	// to be synthesised from the request instead. Callers log it so the
+	// degradation is observable rather than silent. Optional; nil is fine.
+	DegradedReplays *int
 }
 
 type responsesChatRequestPlan struct {
@@ -344,7 +349,43 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			if replayCalls != 0 && replayCalls != len(projected) {
 				return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
 			}
-			if replayCalls == 0 {
+			// Resolve the stored Responses items for this assistant turn.
+			//
+			// A MISSING group is not fatal. The store is an in-memory LRU with a
+			// one-hour TTL, so it is lost on expiry, on eviction under load, and
+			// on every proxy restart — none of which are the client's doing, and
+			// all of which used to wedge the conversation permanently: the ids
+			// stay in the transcript, so every subsequent request re-resolved
+			// them and re-failed. Instead fall through to the same synthesis
+			// path used for non-replay tool calls below, which rebuilds the
+			// function_call items from the request itself. That loses the
+			// upstream reasoning items for this turn (continuity, not
+			// correctness — reasoning items are optional on the wire, while the
+			// function_call items are mandatory) and keeps the session alive.
+			//
+			// Only `missing` degrades. `mixed` and `projection` mismatches mean
+			// the request itself is inconsistent, and `closed` means shutdown;
+			// those still fail loudly.
+			degradedReplay := false
+			var resolution responsesChatReplayResolution
+			if replayCalls != 0 {
+				if options.ReplayStore == nil {
+					return nil, missingResponsesChatReplayError()
+				}
+				projectionContent, _ := json.Marshal(assistantHistoryText(content))
+				var resolveErr error
+				resolution, resolveErr = resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
+				switch {
+				case errors.Is(resolveErr, errResponsesChatReplayMissing):
+					degradedReplay = true
+					if options.DegradedReplays != nil {
+						*options.DegradedReplays++
+					}
+				case resolveErr != nil:
+					return nil, mapResponsesChatReplayResolveError(resolveErr)
+				}
+			}
+			if replayCalls == 0 || degradedReplay {
 				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
 					input = appendAssistantHistoryMessage(input, assistantText)
 				}
@@ -371,14 +412,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				}
 				continue
 			}
-			if options.ReplayStore == nil {
-				return nil, missingResponsesChatReplayError()
-			}
-			projectionContent, _ := json.Marshal(assistantHistoryText(content))
-			resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
-			if err != nil {
-				return nil, mapResponsesChatReplayResolveError(err)
-			}
+			// Store hit: `resolution` was populated above.
 			if _, duplicate := restoredGroups[resolution.GroupID]; duplicate {
 				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
 			}

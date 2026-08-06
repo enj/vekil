@@ -171,13 +171,23 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		PublicModel:   route.publicModel,
 		UpstreamModel: route.upstreamModel,
 	}
+	degradedReplays := 0
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
 		ReplayStore:         h.responsesChatReplayStore(),
 		ReplayRoute:         replayRoute,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
+		DegradedReplays:     &degradedReplays,
 	})
+	if degradedReplays > 0 {
+		// Info rather than Debug: the turn still succeeds, but the model lost
+		// its stored reasoning items for those assistant turns, so a quality
+		// dip has a cause the operator can point at instead of guessing.
+		h.log.Info("responses replay state unavailable; synthesised tool calls from request",
+			logger.F("assistant_turns", degradedReplays),
+			logger.F("public_model", route.publicModel))
+	}
 	if err != nil {
 		return chatExecutionResult{}, err
 	}

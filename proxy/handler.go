@@ -295,13 +295,16 @@ type ProxyHandler struct {
 	policyPreflightPending           atomic.Bool
 	responsesChatReplayMu            sync.Mutex
 	responsesChatReplay              *responsesChatReplayStore
-	geminiCounts                     geminiCountTokensCache
-	stats                            *statsCollector
-	stateBindingsOnce                sync.Once
-	stateBindings                    *stateBindingStore
-	stateBindingsErr                 error
-	insightGate                      *insightGate
-	insightGateOnce                  sync.Once
+	// responsesReplayPersistDir backs the in-memory replay LRU with files
+	// that survive its TTL and the process. Empty = memory only.
+	responsesReplayPersistDir string
+	geminiCounts              geminiCountTokensCache
+	stats                     *statsCollector
+	stateBindingsOnce         sync.Once
+	stateBindings             *stateBindingStore
+	stateBindingsErr          error
+	insightGate               *insightGate
+	insightGateOnce           sync.Once
 }
 
 // initializeLifecycle installs the proxy-owned cancellation root used by
@@ -331,7 +334,9 @@ func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
 	h.responsesChatReplayMu.Lock()
 	defer h.responsesChatReplayMu.Unlock()
 	if h.responsesChatReplay == nil && !h.ShuttingDown() {
-		h.responsesChatReplay = newResponsesChatReplayStore()
+		h.responsesChatReplay = newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
+			PersistDir: h.responsesReplayPersistDir,
+		})
 	}
 	return h.responsesChatReplay
 }
@@ -686,6 +691,16 @@ type Option func(*ProxyHandler)
 // used for upstream requests. The raw override values are retained so endpoint-
 // scoped header logic can distinguish an explicitly configured OpenAI intent
 // from the built-in chat/responses default.
+// WithResponsesReplayPersistDir backs the Responses replay LRU with durable
+// files. Without it, every proxy restart and every TTL expiry permanently
+// wedges any conversation holding call_vekil_ ids, because those ids stay in
+// the client transcript and re-resolve forever.
+func WithResponsesReplayPersistDir(dir string) Option {
+	return func(h *ProxyHandler) {
+		h.responsesReplayPersistDir = strings.TrimSpace(dir)
+	}
+}
+
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg

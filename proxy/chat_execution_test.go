@@ -3,11 +3,11 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
@@ -103,20 +103,40 @@ func newChatExecutionTestHandler(t *testing.T, baseURL string, endpoints []strin
 
 func TestExecuteChatCompletionsPinsReplayIDsToResponsesBackend(t *testing.T) {
 	upstreamCalls := 0
+	var upstreamPaths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
+		upstreamPaths = append(upstreamPaths, r.URL.Path)
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	}))
 	defer upstream.Close()
 	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions, providerEndpointResponses})
 	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
-	_, err := h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
-	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayMissingCode {
-		t.Fatalf("error = %#v", err)
+	_, _ = h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
+	// The load-bearing assertion is the routing one: a replay ID must never be
+	// sent to the native Chat endpoint. It must pin to the Responses backend.
+	//
+	// This used to also assert a responses_replay_state_missing error, because
+	// an unresolvable replay ID was fatal. It no longer is: unresolvable state
+	// now degrades to synthesising the call from the request (see
+	// translateChatMessagesToResponses), because the ids live in the client
+	// transcript forever and a hard error wedged the conversation permanently.
+	// The invariant: a replay ID pins the request to the Responses backend and
+	// must never reach native Chat, where call_vekil_ ids are meaningless.
+	//
+	// This previously asserted upstreamCalls == 0, which held only because an
+	// unresolvable replay ID was fatal before any upstream call. Unresolvable
+	// state now degrades (the ids live in the client transcript forever, so a
+	// hard error wedged the conversation permanently), so a call IS expected —
+	// and counting calls can no longer tell the two endpoints apart. Assert the
+	// endpoint directly instead.
+	for _, path := range upstreamPaths {
+		if strings.Contains(path, "chat/completions") {
+			t.Fatalf("replay ID reached native Chat: paths = %v", upstreamPaths)
+		}
 	}
-	if upstreamCalls != 0 {
-		t.Fatalf("upstream calls = %d; replay ID must not be sent to native Chat", upstreamCalls)
+	if upstreamCalls == 0 {
+		t.Fatal("upstream was never called; the turn was dropped rather than degraded")
 	}
 }
 
