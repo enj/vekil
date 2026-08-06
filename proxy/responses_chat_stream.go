@@ -462,6 +462,10 @@ func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolSta
 type responsesChatStreamTransition struct {
 	chunks   []models.OpenAIStreamChunk
 	terminal bool
+	// carriedReasoning is the terminal turn's Responses output array, on its
+	// way to a thinking block so the client holds it for the next turn. Set
+	// only on the terminal transition of a tool-call turn.
+	carriedReasoning []json.RawMessage
 }
 
 func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (responsesChatStreamTransition, error) {
@@ -1039,6 +1043,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	hasRefusal := false
 	// Chat-style surfaces intentionally do not run command_rewrite; they preserve
 	// upstream arguments and only capture tool context for later output reduction.
+	// Tracks which calls completed; drives exposeTools below.
 	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.tools))
 	for outputIndex, raw := range event.Response.Output {
 		var header struct {
@@ -1131,7 +1136,8 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		}
 	}
 
-	assistantContent, _ := json.Marshal(assistantText.String())
+	// (assistantText fed the replay projection; the carrier needs only the
+	// raw output array, so nothing marshals it now.)
 	if len(s.tools) > 0 && hasRefusal {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses tool-call turns with refusal content are not supported")
 	}
@@ -1144,30 +1150,20 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		return responsesChatStreamTransition{}, err
 	}
 	chunks := make([]models.OpenAIStreamChunk, 0, len(s.tools)*2+2)
+	var carriedReasoning []json.RawMessage
 	if exposeTools {
-		if s.config.ReplayStore == nil {
-			replayErr := newChatServerError("responses_replay_unavailable", "Responses replay storage is unavailable")
-			attachChatExecutionErrorUsage(replayErr, terminalUsage)
-			return usageFailureTransition, replayErr
-		}
-		published, err := s.config.ReplayStore.Publish(responsesChatReplayPublishRequest{
-			Route: s.config.ReplayRoute, AssistantContent: assistantContent, OutputItems: event.Response.Output, Calls: publishCalls,
-		})
-		if err != nil {
-			replayErr := mapResponsesChatReplayPublishError(err)
-			attachChatExecutionErrorUsage(replayErr, terminalUsage)
-			return usageFailureTransition, replayErr
-		}
-		proxyByUpstream := make(map[string]string, len(published.Calls))
-		for _, call := range published.Calls {
-			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
-		}
+		// Carry the turn to the client instead of storing it, and pass
+		// Copilot's own call ids straight through.
+		//
+		// No ReplayStore check any more: nothing is stored, so storage can no
+		// longer be "unavailable" and take a streaming turn down with it.
+		//
+		// The terminal response.completed event repeats the whole output array,
+		// which is why streaming needs no accumulation across deltas — the
+		// per-delta handler discards reasoning payloads on purpose.
+		carriedReasoning = event.Response.Output
 		for _, tool := range s.tools {
-			proxyID := proxyByUpstream[tool.upstreamCall]
-			if proxyID == "" {
-				return responsesChatStreamTransition{}, newChatServerError("responses_replay_state_invalid", "published Responses replay state is incomplete")
-			}
-			chunks = append(chunks, s.toolStartChunk(tool, proxyID))
+			chunks = append(chunks, s.toolStartChunk(tool, tool.upstreamCall))
 			if tool.arguments.Len() > 0 {
 				chunks = append(chunks, s.toolArgumentsChunk(tool))
 			}
@@ -1182,7 +1178,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		chunks = append(chunks, s.usageChunk(terminalUsage))
 	}
 	s.terminalSeen = true
-	return responsesChatStreamTransition{chunks: chunks, terminal: true}, nil
+	return responsesChatStreamTransition{chunks: chunks, terminal: true, carriedReasoning: carriedReasoning}, nil
 }
 
 func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
@@ -1392,6 +1388,12 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 				if err := emitChunks(nil); err != nil {
 					return err
 				}
+			}
+			// Hand the turn's output items over before closing the stream, so
+			// the surface adapter can attach them to the response it is
+			// assembling.
+			if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {
+				return err
 			}
 			if err := writer.succeed(); err != nil {
 				return err

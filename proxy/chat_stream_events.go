@@ -32,12 +32,24 @@ const (
 	chatStreamEventChunk chatStreamEventKind = iota + 1
 	chatStreamEventSuccess
 	chatStreamEventError
+	// chatStreamEventCarriedReasoning transports this turn's Responses output
+	// array to the surface adapter, which turns it into an Anthropic thinking
+	// block so the CLIENT holds it for the next turn.
+	//
+	// A distinct event kind rather than a field on the chunk: chunks are
+	// chat-shaped and get serialised to whichever surface asked, and this is
+	// internal transport that must never reach the wire. Adapters that do not
+	// understand the kind ignore it, which is exactly right for the OpenAI
+	// surface — it has nowhere to put a carrier anyway.
+	chatStreamEventCarriedReasoning
 )
 
 type chatStreamEvent struct {
 	kind      chatStreamEventKind
 	chunk     models.OpenAIStreamChunk
 	streamErr *chatStreamError
+	// carriedReasoning is set only on chatStreamEventCarriedReasoning.
+	carriedReasoning []json.RawMessage
 }
 
 // chatStreamError names the execution error carried by a terminal stream event.
@@ -105,6 +117,16 @@ func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *ch
 
 func (w *chatStreamEventWriter) sendChunk(chunk models.OpenAIStreamChunk) error {
 	return w.send(chatStreamEvent{kind: chatStreamEventChunk, chunk: chunk}, false)
+}
+
+// sendCarriedReasoning hands the turn's Responses output items to the surface
+// adapter. Emitted before succeed() so the adapter has them while it is still
+// assembling the response.
+func (w *chatStreamEventWriter) sendCarriedReasoning(items []json.RawMessage) error {
+	if len(items) == 0 {
+		return nil
+	}
+	return w.send(chatStreamEvent{kind: chatStreamEventCarriedReasoning, carriedReasoning: items}, false)
 }
 
 func (w *chatStreamEventWriter) succeed() error {
@@ -185,7 +207,15 @@ func (s *chatStreamEventStream) stop(cause error) {
 	s.cancel(cause)
 }
 
-func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error) (err error) {
+func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error,
+	onCarriedReasoning ...func([]json.RawMessage),
+) (err error) {
+	// Variadic so existing callers -- surfaces that cannot transport
+	// reasoning -- need no change.
+	var carriedReasoningHook func([]json.RawMessage)
+	if len(onCarriedReasoning) > 0 {
+		carriedReasoningHook = onCarriedReasoning[0]
+	}
 	defer func() {
 		if stream != nil {
 			stream.stop(err)
@@ -206,6 +236,15 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 			}
 		case chatStreamEventSuccess:
 			return nil
+		case chatStreamEventCarriedReasoning:
+			// Surfaces that can transport reasoning (Anthropic) attach it;
+			// those that cannot (OpenAI chat) ignore it. Deliberately not
+			// handled by the `default` arm below, which errors on unknown
+			// kinds — silently dropping a kind the adapter simply does not
+			// implement is correct, but only when it is an explicit choice.
+			if carriedReasoningHook != nil {
+				carriedReasoningHook(event.carriedReasoning)
+			}
 		case chatStreamEventError:
 			if event.streamErr == nil {
 				return &chatStreamError{StatusCode: http.StatusBadGateway}
@@ -221,6 +260,10 @@ type chatStreamEventCallbacks struct {
 	DropUsage bool
 	OnUsage   func(*models.OpenAIUsage)
 	OnFinal   func(*models.OpenAIResponse)
+	// OnCarriedReasoning receives the turn's Responses output items so a
+	// surface that can transport them (Anthropic) hands them to the client.
+	// Nil on surfaces that cannot.
+	OnCarriedReasoning func([]json.RawMessage)
 }
 
 func selectChatStreamEventCallbacks(callbacks []chatStreamEventCallbacks) chatStreamEventCallbacks {
@@ -396,6 +439,9 @@ func streamChatEventsToAnthropic(
 			return errChatStreamClientWriteFailed
 		}
 		return nil
+	}, func(items []json.RawMessage) {
+		// Anthropic can transport reasoning, so hand it to the client.
+		_ = state.emitCarriedReasoning(items)
 	})
 	if err != nil {
 		var streamErr *chatStreamError

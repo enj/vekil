@@ -1832,6 +1832,42 @@ func (s *anthropicStreamState) consumeChoice(choice models.OpenAIStreamChoice) b
 	return true
 }
 
+// emitCarriedReasoning writes this turn's Responses output items as a
+// standalone thinking block so the client persists and replays them.
+//
+// TRAILING, unlike the non-streaming path where the carrier leads. The items
+// only become known at the terminal response.completed event, long after the
+// content blocks have streamed, so leading is not available. That is fine:
+// extraction scans every block in a message rather than assuming a position.
+//
+// Emitted as start+stop with no delta — the payload rides in the signature,
+// and the thinking text is deliberately empty.
+func (s *anthropicStreamState) emitCarriedReasoning(outputItems []json.RawMessage) bool {
+	signature, err := encodeReasoningCarrier(outputItems)
+	if err != nil || signature == "" {
+		return true // nothing to carry, or an encode problem: not fatal to the turn
+	}
+	if !s.closeOpenToolBlocks() {
+		return false
+	}
+	index := s.nextBlockIndex
+	s.nextBlockIndex++
+	if !s.emit("content_block_start", models.AnthropicStreamEvent{
+		Type:  "content_block_start",
+		Index: intVal(index),
+		ContentBlock: &models.ContentBlock{
+			Type:      "thinking",
+			Signature: signature,
+		},
+	}) {
+		return false
+	}
+	return s.emit("content_block_stop", models.AnthropicStreamEvent{
+		Type:  "content_block_stop",
+		Index: intVal(index),
+	})
+}
+
 func (s *anthropicStreamState) emitText(text string) bool {
 	if !s.closeOpenToolBlocks() {
 		return false

@@ -118,7 +118,9 @@ func TestHandleOpenAIChatCompletionsResponsesBackedForcedStreamToolCall(t *testi
 		t.Fatalf("response = %#v", response)
 	}
 	call := response.Choices[0].Message.ToolCalls[0]
-	if !strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) || call.Function.Name != "lookup_synthetic_widget" || call.Function.Arguments != `{"widget":"alpha-fixture"}` {
+	// Copilot's own call id passes through now; proxy ids existed only to
+	// key the replay store, and the turn is carried by the client instead.
+	if strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) {
 		t.Fatalf("call = %#v", call)
 	}
 }

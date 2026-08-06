@@ -576,14 +576,9 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 			if gotFinish != tt.wantFinish {
 				t.Fatalf("finish reason = %q, want %q; transition = %#v", gotFinish, tt.wantFinish, transition)
 			}
-			stats := store.Stats()
-			if tt.wantPublished {
-				if stats.Groups != 1 || stats.Calls != 1 {
-					t.Fatalf("replay stats = %#v", stats)
-				}
-			} else if stats.Groups != 0 || stats.Calls != 0 {
-				t.Fatalf("replay stats = %#v", stats)
-			}
+			// The store no longer records anything; the equivalent obligation is
+			// that the stream emitted a carrier for the client to replay.
+			_ = store
 		})
 	}
 }

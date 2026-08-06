@@ -71,14 +71,26 @@ func readResponsesChatStreamFixture(t *testing.T, name string) []byte {
 
 func collectResponsesChatStreamChunks(t *testing.T, stream *chatStreamEventStream) []models.OpenAIStreamChunk {
 	t.Helper()
+	chunks, _ := collectResponsesChatStreamChunksAndCarrier(t, stream)
+	return chunks
+}
+
+// collectResponsesChatStreamChunksAndCarrier also returns the reasoning the
+// stream handed over for the client to replay, which is what replaced the
+// replay store on this path.
+func collectResponsesChatStreamChunksAndCarrier(t *testing.T, stream *chatStreamEventStream) ([]models.OpenAIStreamChunk, []json.RawMessage) {
+	t.Helper()
 	var chunks []models.OpenAIStreamChunk
+	var carried []json.RawMessage
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
+	}, func(items []json.RawMessage) {
+		carried = items
 	}); err != nil {
 		t.Fatalf("consumeChatStreamEvents() error = %v", err)
 	}
-	return chunks
+	return chunks, carried
 }
 
 func streamChunkText(t *testing.T, chunk models.OpenAIStreamChunk) string {
@@ -108,12 +120,15 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareResponsesChatStream() error = %v", err)
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
+	chunks, carried := collectResponsesChatStreamChunksAndCarrier(t, stream)
 	if len(chunks) != 5 {
 		t.Fatalf("chunk count = %d, want 5: %#v", len(chunks), chunks)
 	}
 	start := chunks[1].Choices[0].Delta.ToolCalls
-	if len(start) != 1 || start[0].Index == nil || *start[0].Index != 0 || start[0].Function.Name != "lookup_synthetic_widget" || !strings.HasPrefix(start[0].ID, responsesChatReplayCallIDPrefix) || start[0].ID == "call_synth_lookup_stream_001" {
+	// Upstream call id passes through; proxy ids only ever keyed the store.
+	if len(start) != 1 || start[0].Index == nil || *start[0].Index != 0 ||
+		start[0].Function.Name != "lookup_synthetic_widget" ||
+		start[0].ID != "call_synth_lookup_stream_001" {
 		t.Fatalf("tool start = %#v", start)
 	}
 	args := chunks[2].Choices[0].Delta.ToolCalls
@@ -123,20 +138,14 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	if got := chunks[3].Choices[0].FinishReason; got == nil || *got != "tool_calls" {
 		t.Fatalf("finish reason = %v", got)
 	}
-	if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 1 {
-		t.Fatalf("replay stats = %#v", stats)
+	// The store records nothing now; the stream hands the turn to the client
+	// instead. Assert that the terminal transition carried the output items,
+	// which is what the next turn replays.
+	if len(carried) == 0 {
+		t.Fatal("stream carried no reasoning for the client")
 	}
-	resolved, err := store.Resolve(route, responsesChatReplayAssistantProjection{
-		Content: json.RawMessage(`""`),
-		Calls: []responsesChatReplayProjectedCall{{
-			ID: start[0].ID, Name: start[0].Function.Name, Arguments: args[0].Function.Arguments,
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Resolve() error = %v", err)
-	}
-	if len(resolved.OutputItems) != 1 || !bytes.Contains(resolved.OutputItems[0], []byte(`"call_id":"call_synth_lookup_stream_001"`)) {
-		t.Fatalf("resolved replay = %#v", resolved)
+	if _, ok := decodeReasoningCarrier(mustEncodeCarrier(t, carried)); !ok {
+		t.Fatal("carried reasoning did not survive a carrier round trip")
 	}
 }
 
@@ -170,13 +179,14 @@ func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
+	chunks, carried := collectResponsesChatStreamChunksAndCarrier(t, stream)
 	if len(chunks) != 7 {
 		t.Fatalf("chunk count = %d, want 7", len(chunks))
 	}
 	for i, chunkIndex := range []int{1, 3} {
 		call := chunks[chunkIndex].Choices[0].Delta.ToolCalls[0]
-		if call.Index == nil || *call.Index != i || !strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) {
+		if call.Index == nil || *call.Index != i ||
+			strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) || call.ID == "" {
 			t.Fatalf("tool start %d = %#v", i, call)
 		}
 		args := chunks[chunkIndex+1].Choices[0].Delta.ToolCalls[0]
@@ -184,8 +194,9 @@ func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T)
 			t.Fatalf("tool args %d = %#v", i, args)
 		}
 	}
-	if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 2 {
-		t.Fatalf("stats = %#v", stats)
+	// Parallel group: both calls are carried in the same output array.
+	if len(carried) == 0 {
+		t.Fatal("parallel tool turn carried no reasoning")
 	}
 }
 
@@ -830,35 +841,19 @@ func TestResponsesChatStream_ChargesPriorVisibleTextWhenToolAppears(t *testing.T
 	}
 }
 
-func TestResponsesChatStream_EmitsUsageBeforeCommittedReplayFailure(t *testing.T) {
-	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
-	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{MaxGroupBytes: 1})
-	state := newResponsesChatStreamState(responsesChatStreamConfig{
-		PublicModel: "gpt-public",
-		ReplayStore: store,
-		ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
-		Now:         time.Now,
-	})
-	parser := responsesSSEParser{allowBOM: true}
-	parser.push(append(fixture, '\n'))
-	var failureTransition responsesChatStreamTransition
-	var failure error
-	for {
-		message, ok := parser.nextSemantic()
-		if !ok {
-			break
-		}
-		transition, err := state.handleMessage(message)
-		if err != nil {
-			failureTransition, failure = transition, err
-			break
-		}
+// TestResponsesChatStream_EmitsUsageBeforeCommittedReplayFailure is gone.
+//
+// It forced a replay-publish failure (MaxGroupBytes: 1) and asserted usage
+// still rode out on the resulting error. Nothing publishes on the streaming
+// path any more -- the turn is carried by the client -- so a store limit
+// cannot fail a stream at all. The failure mode is removed rather than
+// handled, which leaves nothing to assert.
+
+func mustEncodeCarrier(t *testing.T, items []json.RawMessage) string {
+	t.Helper()
+	signature, err := encodeReasoningCarrier(items)
+	if err != nil {
+		t.Fatalf("encode carrier: %v", err)
 	}
-	var executionErr *chatExecutionError
-	if !errors.As(failure, &executionErr) || executionErr.Usage == nil {
-		t.Fatalf("error = %#v", failure)
-	}
-	if len(failureTransition.chunks) != 1 || failureTransition.chunks[0].Usage == nil {
-		t.Fatalf("transition = %#v", failureTransition)
-	}
+	return signature
 }
