@@ -70,3 +70,43 @@ func TestPrependCarriedReasoningIsNoOpWithoutItems(t *testing.T) {
 		t.Fatal("nil response should stay nil")
 	}
 }
+
+// The original bug, as a test: a transcript full of call_vekil_ ids with no
+// carrier and no store must keep working. Erroring here is what wedged
+// sessions permanently, since those ids never leave the client transcript.
+func TestLegacyReplayIDsDegradeInsteadOfWedging(t *testing.T) {
+	body := []byte(`{"model":"gpt","messages":[` +
+		`{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}` +
+		`],"max_tokens":64}`)
+
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt"})
+	if err != nil {
+		t.Fatalf("legacy replay ids must degrade, not fail: %v", err)
+	}
+	var envelope struct {
+		Input []json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(plan.Body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	// The mandatory half must be present: a function_call_output without its
+	// function_call is rejected upstream ("No tool call found for function
+	// call output"), which would be a different wedge.
+	var sawCall, sawOutput bool
+	for _, item := range envelope.Input {
+		var header struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(item, &header)
+		switch header.Type {
+		case "function_call":
+			sawCall = true
+		case "function_call_output":
+			sawOutput = true
+		}
+	}
+	if !sawCall || !sawOutput {
+		t.Fatalf("degraded turn is missing its call/output pair: call=%v output=%v", sawCall, sawOutput)
+	}
+}

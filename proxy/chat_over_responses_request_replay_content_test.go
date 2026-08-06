@@ -6,28 +6,14 @@ import (
 )
 
 func TestTranslateChatRequestToResponsesNormalizesReplayAssistantContentParts(t *testing.T) {
-	store := newResponsesChatReplayStore()
-	defer func() { _ = store.Close() }()
-
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	published, err := store.Publish(responsesChatReplayPublishRequest{
-		Route:            route,
-		AssistantContent: json.RawMessage(`"checking status"`),
-		OutputItems: []json.RawMessage{
-			json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking "},{"type":"output_text","text":"status"}]}`),
-			json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup","arguments":"{}","status":"completed"}`),
-		},
-		Calls: []responsesChatReplayPublishCall{{
-			UpstreamCallID:   "upstream-call-1",
-			Name:             "lookup",
-			VisibleArguments: `{}`,
-			OutputItemIndex:  1,
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Publish() error = %v", err)
+	// Carried by the client instead of published to a store; the tool id is
+	// Copilot's own, which is what a carried turn keys on.
+	carriedItems := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking "},{"type":"output_text","text":"status"}]}`),
+		json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup","arguments":"{}","status":"completed"}`),
 	}
-	call := published.Projection.Calls[0]
+	call := struct{ ID, Name, Arguments string }{ID: "upstream-call-1", Name: "lookup", Arguments: `{}`}
 	request := map[string]any{
 		"model": "gpt-public",
 		"messages": []any{
@@ -55,9 +41,9 @@ func TestTranslateChatRequestToResponsesNormalizesReplayAssistantContentParts(t 
 	}
 
 	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
-		UpstreamModel: "gpt-upstream",
-		ReplayStore:   store,
-		ReplayRoute:   route,
+		UpstreamModel:    "gpt-upstream",
+		CarriedReasoning: map[string][]json.RawMessage{"upstream-call-1": carriedItems},
+		ReplayRoute:      route,
 	})
 	if err != nil {
 		t.Fatalf("translateChatRequestToResponses() error = %v", err)

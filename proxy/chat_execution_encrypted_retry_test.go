@@ -72,7 +72,7 @@ func TestExecuteResponsesBackedChatRetriesEncryptedReplayOnCapturedRoute(t *test
 	t.Cleanup(upstream.Close)
 
 	h := newResponsesChatEncryptedRetryTestHandler(t, upstream.URL, fallback.URL)
-	result, err := h.executeChatCompletions(context.Background(), responsesChatEncryptedReplayRequestBody(t, h), chatExecutionOptions{})
+	result, err := h.executeChatCompletions(context.Background(), responsesChatEncryptedReplayRequestBody(t, h), responsesChatEncryptedReplayOptions())
 	if err != nil {
 		t.Fatalf("executeChatCompletions() error = %v", err)
 	}
@@ -153,7 +153,7 @@ func TestExecuteResponsesBackedChatDoesNotRetryEncryptedReplayOnUnrelatedError(t
 	t.Cleanup(upstream.Close)
 
 	h := newResponsesChatEncryptedRetryTestHandler(t, upstream.URL, fallback.URL)
-	result, err := h.executeChatCompletions(context.Background(), responsesChatEncryptedReplayRequestBody(t, h), chatExecutionOptions{})
+	result, err := h.executeChatCompletions(context.Background(), responsesChatEncryptedReplayRequestBody(t, h), responsesChatEncryptedReplayOptions())
 	if err != nil {
 		t.Fatalf("executeChatCompletions() error = %v", err)
 	}
@@ -215,33 +215,34 @@ func newResponsesChatEncryptedRetryTestHandler(t *testing.T, baseURL, fallbackUR
 	return h
 }
 
+// responsesChatEncryptedReplayRequestBody builds a turn whose reasoning is
+// carried rather than stored.
+//
+// It used to Publish to the replay store and use the minted proxy id. There is
+// no store now: the items ride with the request via chatExecutionOptions, the
+// same way the Anthropic surface supplies them after decoding a client
+// thinking block, and the tool id is Copilot's own.
+func responsesChatEncryptedReplayCarriedItems() []json.RawMessage {
+	return []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"reasoning-retry","encrypted_content":"` + responsesChatRetryEncryptedToken + `"}`),
+		json.RawMessage(`{"type":"function_call","id":"item-retry","call_id":"upstream-call-retry","name":"lookup","arguments":"{}","status":"completed"}`),
+	}
+}
+
+func responsesChatEncryptedReplayOptions() chatExecutionOptions {
+	return chatExecutionOptions{
+		CarriedReasoning: map[string][]json.RawMessage{
+			"upstream-call-retry": responsesChatEncryptedReplayCarriedItems(),
+		},
+	}
+}
+
 func responsesChatEncryptedReplayRequestBody(t *testing.T, h *ProxyHandler) []byte {
 	t.Helper()
-	route := responsesChatReplayRoute{
-		ProviderID:    "captured-provider",
-		PublicModel:   "gpt-public",
-		UpstreamModel: "captured-deployment",
+	_ = h
+	call := struct{ ID, Name, Arguments string }{
+		ID: "upstream-call-retry", Name: "lookup", Arguments: `{}`,
 	}
-	published, err := h.responsesChatReplayStore().Publish(responsesChatReplayPublishRequest{
-		Route:            route,
-		AssistantContent: json.RawMessage(`null`),
-		OutputItems: []json.RawMessage{
-			json.RawMessage(`{"type":"reasoning","id":"reasoning-retry","encrypted_content":"` + responsesChatRetryEncryptedToken + `"}`),
-			json.RawMessage(`{"type":"function_call","id":"item-retry","call_id":"upstream-call-retry","name":"lookup","arguments":"{}","status":"completed"}`),
-		},
-		Calls: []responsesChatReplayPublishCall{
-			{
-				UpstreamCallID:   "upstream-call-retry",
-				Name:             "lookup",
-				VisibleArguments: `{}`,
-				OutputItemIndex:  1,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Publish() error = %v", err)
-	}
-	call := published.Projection.Calls[0]
 	body, err := json.Marshal(map[string]any{
 		"model": "gpt-public",
 		"messages": []any{

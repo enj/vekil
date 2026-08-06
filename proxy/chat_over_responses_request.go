@@ -416,51 +416,44 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				}
 				continue
 			}
-			if options.ReplayStore == nil {
-				return nil, missingResponsesChatReplayError()
+			// Legacy `call_vekil_*` ids that arrive with no carrier.
+			//
+			// These come from transcripts recorded when the proxy minted its
+			// own ids and kept the payload server-side. That store is gone, so
+			// there is nothing to resolve them against — and erroring would
+			// wedge the conversation permanently, because the ids live in the
+			// client transcript forever and every later request would re-fail
+			// identically. That was the original bug.
+			//
+			// Degrade instead: rebuild the turn from the request. The reasoning
+			// for that specific turn is unrecoverable (it expired with the
+			// store), but reasoning items are optional on the wire while
+			// function_call items are mandatory, so the conversation lives.
+			if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
+				input = appendAssistantHistoryMessage(input, assistantText)
 			}
-			projectionContent, _ := json.Marshal(assistantHistoryText(content))
-			resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
-			if err != nil {
-				return nil, mapResponsesChatReplayResolveError(err)
-			}
-			if _, duplicate := restoredGroups[resolution.GroupID]; duplicate {
-				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
-			}
-			restoredGroups[resolution.GroupID] = struct{}{}
-			resolvedByProxy := make(map[string]responsesChatReplayResolvedCall, len(resolution.Calls))
-			matchedResults := 0
-			for _, call := range resolution.Calls {
-				resolvedByProxy[call.ProxyCallID] = call
-				if resultIndex, ok := resultIndices[call.ProxyCallID]; ok && resultIndex > index {
-					matchedResults++
+			legacyMatched := 0
+			for _, projectedCall := range projected {
+				if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
+					legacyMatched++
 				}
 			}
-			if matchedResults == 0 {
-				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "Responses-backed assistant tool calls require at least one subsequent tool result")
-			}
-			if matchedResults == len(resolution.Calls) {
-				input = append(input, cloneReplayRawMessages(resolution.OutputItems)...)
-			} else {
-				// Live gpt-5.6-sol rejects a complete parallel call group when only a
-				// subset has outputs. Replay the visible assistant text plus only the
-				// exact calls that have results; the store remains intact for retries.
-				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
-					input = appendAssistantHistoryMessage(input, assistantText)
-				}
-				for _, projectedCall := range projected {
-					resolved := resolvedByProxy[projectedCall.ID]
-					if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
-						input = append(input, cloneReplayRawMessage(resolved.OutputItem))
-					}
-				}
+			if legacyMatched == 0 {
+				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
 			}
 			for callIndex, projectedCall := range projected {
+				if legacyMatched < len(projected) {
+					if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
+						continue
+					}
+				}
 				if _, duplicate := calls[projectedCall.ID]; duplicate {
 					return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls[%d].id", index, callIndex), "duplicate tool call ID")
 				}
-				calls[projectedCall.ID] = resolvedByProxy[projectedCall.ID].UpstreamCallID
+				calls[projectedCall.ID] = projectedCall.ID
+				input = append(input, syntheticItems[callIndex])
 			}
+			continue
 		case "tool":
 			if len(bytes.TrimSpace(message.Refusal)) > 0 && !bytes.Equal(bytes.TrimSpace(message.Refusal), []byte("null")) {
 				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].refusal", index), "refusal is not valid for tool messages")

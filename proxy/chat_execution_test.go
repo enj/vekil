@@ -3,11 +3,11 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
@@ -102,21 +102,26 @@ func newChatExecutionTestHandler(t *testing.T, baseURL string, endpoints []strin
 }
 
 func TestExecuteChatCompletionsPinsReplayIDsToResponsesBackend(t *testing.T) {
-	upstreamCalls := 0
+	var upstreamPaths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
+		upstreamPaths = append(upstreamPaths, r.URL.Path)
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	}))
 	defer upstream.Close()
 	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions, providerEndpointResponses})
 	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
-	_, err := h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
-	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayMissingCode {
-		t.Fatalf("error = %#v", err)
-	}
-	if upstreamCalls != 0 {
-		t.Fatalf("upstream calls = %d; replay ID must not be sent to native Chat", upstreamCalls)
+	_, _ = h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
+	// The invariant that survives: a replay id pins to the Responses backend
+	// and must never reach native Chat, where it is meaningless.
+	//
+	// This also asserted a responses_replay_state_missing error, which no
+	// longer happens: an unresolvable legacy id degrades into a synthesised
+	// turn instead of failing, because those ids live in the client transcript
+	// forever and erroring wedged the conversation permanently.
+	for _, path := range upstreamPaths {
+		if strings.Contains(path, "chat/completions") {
+			t.Fatalf("replay ID reached native Chat: %v", upstreamPaths)
+		}
 	}
 }
 

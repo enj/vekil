@@ -315,12 +315,10 @@ func TestTranslateChatRequestToResponsesValidatesHistoryAndLimits(t *testing.T) 
 			body:  `{"model":"a","messages":[{"role":"assistant","tool_calls":[{"id":"call_external","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_external","content":"one"},{"role":"tool","tool_call_id":"call_external","content":"two"}]}`,
 			param: "messages[2].tool_call_id",
 		},
-		{
-			name:  "tagged replay state missing",
-			body:  `{"model":"a","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"result"}]}`,
-			param: "messages",
-			code:  "responses_replay_state_missing",
-		},
+		// "tagged replay state missing" removed: a legacy call_vekil_ id with no
+		// carrier now degrades into a synthesised turn instead of erroring. Those
+		// ids never leave the client transcript, so failing on them wedged the
+		// conversation permanently. See TestLegacyReplayIDsDegradeInsteadOfWedging.
 		{
 			name:  "assistant image rejected",
 			body:  `{"model":"a","messages":[{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}`,

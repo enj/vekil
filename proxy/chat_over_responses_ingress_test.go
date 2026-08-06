@@ -421,11 +421,15 @@ func TestHandleOpenAIChatCompletionsResponsesReplayMissingAfterRestart(t *testin
 	})
 	rec := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	// A legacy replay id with no carrier must degrade, not 400. The ids stay
+	// in the client transcript forever, so failing here wedged the session
+	// permanently -- the bug this design removes. The stub upstream answers
+	// 500, so the only thing to assert is that we got past translation.
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("request was rejected instead of degrading: %s", rec.Body.String())
 	}
-	if upstreamCalls != 0 {
-		t.Fatalf("upstream calls = %d", upstreamCalls)
+	if upstreamCalls == 0 {
+		t.Fatal("upstream was never called; the turn was dropped rather than degraded")
 	}
 	var response struct {
 		Error struct {
@@ -435,8 +439,8 @@ func TestHandleOpenAIChatCompletionsResponsesReplayMissingAfterRestart(t *testin
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Error.Type != "invalid_request_error" || response.Error.Code != "responses_replay_state_missing" || response.Error.Param != "messages" || response.Error.Message != "Responses-backed tool state is no longer available; restart the assistant tool-call turn." {
-		t.Fatalf("error = %#v", response.Error)
+	if response.Error.Code == "responses_replay_state_missing" {
+		t.Fatalf("still surfacing the wedge error: %#v", response.Error)
 	}
 }
 
