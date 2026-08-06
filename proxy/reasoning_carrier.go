@@ -36,6 +36,8 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+
+	"github.com/sozercan/vekil/models"
 )
 
 // reasoningCarrierPrefix version-tags the signature. An unrecognised prefix
@@ -128,4 +130,63 @@ func reasoningCarrierBlock(outputItems []json.RawMessage) (map[string]any, error
 		"thinking":  "",
 		"signature": signature,
 	}, nil
+}
+
+// extractCarriedReasoning collects, for every assistant tool_use id in an
+// Anthropic request, the Responses output items carried alongside it.
+//
+// Runs as a separate pass rather than threading a return value through
+// translateMessage/TranslateAnthropicToOpenAI. Those functions build the Chat
+// message body, and a thinking block is transport rather than content — it
+// still has no place in an OpenAI message, so they keep skipping it and their
+// signatures stay put.
+//
+// Keyed by tool_use id because a conversation has many assistant turns, each
+// with its own reasoning, and message indices shift the moment a client trims
+// history. Every tool_use in one assistant message maps to that message's
+// carrier: the Responses output array covers the whole turn, including
+// parallel calls.
+//
+// Messages without a carrier are simply absent from the map. The caller
+// degrades for those, which is what makes legacy transcripts — recorded
+// before this existed, or by a client that drops thinking blocks — keep
+// working instead of failing.
+func extractCarriedReasoning(messages []models.AnthropicMessage) map[string][]json.RawMessage {
+	carried := make(map[string][]json.RawMessage)
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		var blocks []models.ContentBlock
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			continue // string content: no blocks, nothing to carry
+		}
+		var items []json.RawMessage
+		var toolUseIDs []string
+		for _, block := range blocks {
+			switch block.Type {
+			case "thinking", "redacted_thinking":
+				if items != nil {
+					continue // first carrier in a message wins
+				}
+				if decoded, ok := decodeReasoningCarrier(block.Signature); ok {
+					items = decoded
+				}
+			case "tool_use":
+				if block.ID != "" {
+					toolUseIDs = append(toolUseIDs, block.ID)
+				}
+			}
+		}
+		if items == nil {
+			continue
+		}
+		for _, id := range toolUseIDs {
+			carried[id] = items
+		}
+	}
+	if len(carried) == 0 {
+		return nil
+	}
+	return carried
 }

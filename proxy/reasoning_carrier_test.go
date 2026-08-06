@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/sozercan/vekil/models"
 )
 
 func sampleReasoningItems() []json.RawMessage {
@@ -166,4 +168,98 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func assistantWithCarrier(t *testing.T, toolUseIDs []string, items []json.RawMessage) models.AnthropicMessage {
+	t.Helper()
+	blocks := []map[string]any{}
+	if items != nil {
+		block, err := reasoningCarrierBlock(items)
+		if err != nil {
+			t.Fatalf("carrier block: %v", err)
+		}
+		blocks = append(blocks, block)
+	}
+	for _, id := range toolUseIDs {
+		blocks = append(blocks, map[string]any{
+			"type": "tool_use", "id": id, "name": "lookup", "input": map[string]any{},
+		})
+	}
+	content, err := json.Marshal(blocks)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return models.AnthropicMessage{Role: "assistant", Content: content}
+}
+
+func TestExtractCarriedReasoningKeysEveryToolUseInTheTurn(t *testing.T) {
+	items := sampleReasoningItems()
+	// Parallel calls in one assistant turn share the turn's output array.
+	msgs := []models.AnthropicMessage{
+		assistantWithCarrier(t, []string{"call_a", "call_b"}, items),
+	}
+	carried := extractCarriedReasoning(msgs)
+	if len(carried) != 2 {
+		t.Fatalf("carried %d ids, want 2", len(carried))
+	}
+	for _, id := range []string{"call_a", "call_b"} {
+		got, ok := carried[id]
+		if !ok || string(got[0]) != string(items[0]) {
+			t.Fatalf("id %q did not map to the turn's items", id)
+		}
+	}
+}
+
+func TestExtractCarriedReasoningIsPerTurn(t *testing.T) {
+	first := []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"turn1"}`)}
+	second := []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"turn2"}`)}
+	msgs := []models.AnthropicMessage{
+		assistantWithCarrier(t, []string{"call_1"}, first),
+		assistantWithCarrier(t, []string{"call_2"}, second),
+	}
+	carried := extractCarriedReasoning(msgs)
+	if string(carried["call_1"][0]) != string(first[0]) {
+		t.Fatalf("call_1 got the wrong turn: %s", carried["call_1"][0])
+	}
+	if string(carried["call_2"][0]) != string(second[0]) {
+		t.Fatalf("call_2 got the wrong turn: %s", carried["call_2"][0])
+	}
+}
+
+// A transcript recorded before this existed, or by a client that drops
+// thinking blocks, must produce no carrier rather than an error. That absence
+// is what lets the caller degrade instead of wedging the conversation.
+func TestExtractCarriedReasoningToleratesTranscriptsWithoutCarriers(t *testing.T) {
+	cases := []struct {
+		name string
+		msgs []models.AnthropicMessage
+	}{
+		{"tool_use with no thinking block", []models.AnthropicMessage{
+			assistantWithCarrier(t, []string{"call_legacy"}, nil)}},
+		{"string content, no blocks", []models.AnthropicMessage{
+			{Role: "assistant", Content: json.RawMessage(`"plain text"`)}}},
+		{"user role is never a carrier", []models.AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}}},
+		{"foreign thinking signature", []models.AnthropicMessage{
+			{Role: "assistant", Content: json.RawMessage(
+				`[{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgC"},` +
+					`{"type":"tool_use","id":"call_x","name":"f","input":{}}]`)}}},
+		{"empty", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if carried := extractCarriedReasoning(tc.msgs); carried != nil {
+				t.Fatalf("expected no carrier, got %v", carried)
+			}
+		})
+	}
+}
+
+// A carrier with no tool_use in its message has nothing to key on. Dropping it
+// is correct: reasoning is only replayed to accompany a tool result.
+func TestExtractCarriedReasoningIgnoresCarrierWithoutToolUse(t *testing.T) {
+	msgs := []models.AnthropicMessage{assistantWithCarrier(t, nil, sampleReasoningItems())}
+	if carried := extractCarriedReasoning(msgs); carried != nil {
+		t.Fatalf("expected no carrier without tool_use, got %v", carried)
+	}
 }
