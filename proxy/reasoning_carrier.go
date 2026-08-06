@@ -233,3 +233,26 @@ func carriedItemsForCalls(carried map[string][]json.RawMessage, projected []resp
 	}
 	return items, true
 }
+
+// prependCarriedReasoning puts this turn's Responses output items into a
+// thinking block at the front of an Anthropic response.
+//
+// Front, because Anthropic orders thinking before the content it produced, and
+// clients replay blocks in order — a carrier trailing its own tool_use blocks
+// would arrive after the calls it explains.
+//
+// A no-op when there is nothing to carry (no tool calls this turn) or the
+// encode fails, so a carrier problem degrades the next turn's reasoning
+// continuity rather than corrupting this turn's response.
+func prependCarriedReasoning(resp *models.AnthropicResponse, outputItems []json.RawMessage) *models.AnthropicResponse {
+	if resp == nil || len(outputItems) == 0 {
+		return resp
+	}
+	signature, err := encodeReasoningCarrier(outputItems)
+	if err != nil || signature == "" {
+		return resp
+	}
+	carrier := models.ContentBlock{Type: "thinking", Signature: signature}
+	resp.Content = append([]models.ContentBlock{carrier}, resp.Content...)
+	return resp
+}

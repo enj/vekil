@@ -59,20 +59,27 @@ func TestTranslateResponsesJSONToChatPublishesFunctionCallReplay(t *testing.T) {
 		t.Fatalf("choice = %#v", choice)
 	}
 	call := choice.Message.ToolCalls[0]
-	if !strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) || call.ID == "call_synth_lookup_001" || call.Function.Name != "lookup_synthetic_widget" || call.Function.Arguments != `{"widget":"alpha-fixture"}` {
+	// Copilot's own call id now reaches the client verbatim. Proxy ids were
+	// minted only to key the replay store; with the reasoning carried in the
+	// client transcript there is no store to key, and passing the upstream id
+	// through is what lets the next turn be rebuilt without one.
+	if call.ID != "call_synth_lookup_001" || call.Function.Name != "lookup_synthetic_widget" || call.Function.Arguments != `{"widget":"alpha-fixture"}` {
 		t.Fatalf("tool call = %#v", call)
 	}
-	resolution, err := store.Resolve(route, responsesChatReplayAssistantProjection{
-		Content: choice.Message.Content,
-		Calls: []responsesChatReplayProjectedCall{{
-			ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments,
-		}},
-	})
-	if err != nil {
-		t.Fatalf("resolve replay: %v", err)
+	// The turn's Responses output must come back for the client to carry.
+	if len(result.CarriedReasoning) == 0 {
+		t.Fatal("no carried reasoning; the next turn would have nothing to replay")
 	}
-	if len(resolution.OutputItems) != 1 || len(resolution.Calls) != 1 || resolution.Calls[0].UpstreamCallID != "call_synth_lookup_001" {
-		t.Fatalf("resolution = %#v", resolution)
+	// The store is no longer consulted. What used to be published-then-resolved
+	// is now carried by the client, so assert the carrier can be decoded back
+	// to the same items instead.
+	signature, err := encodeReasoningCarrier(result.CarriedReasoning)
+	if err != nil {
+		t.Fatalf("encode carrier: %v", err)
+	}
+	decoded, ok := decodeReasoningCarrier(signature)
+	if !ok || len(decoded) != len(result.CarriedReasoning) {
+		t.Fatalf("carrier did not round-trip: ok=%v decoded=%d", ok, len(decoded))
 	}
 }
 
@@ -107,7 +114,11 @@ func TestTranslateResponsesJSONToChatOutputMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 		calls := result.Response.Choices[0].Message.ToolCalls
-		if len(calls) != 2 || calls[0].ID == calls[1].ID || !strings.HasPrefix(calls[0].ID, responsesChatReplayCallIDPrefix) || !strings.HasPrefix(calls[1].ID, responsesChatReplayCallIDPrefix) {
+		// Upstream ids pass through now; they must still be distinct, since a
+		// parallel group keys its carrier by each call id.
+		if len(calls) != 2 || calls[0].ID == calls[1].ID ||
+			strings.HasPrefix(calls[0].ID, responsesChatReplayCallIDPrefix) ||
+			strings.HasPrefix(calls[1].ID, responsesChatReplayCallIDPrefix) {
 			t.Fatalf("calls = %#v", calls)
 		}
 	})
@@ -265,8 +276,15 @@ func TestTranslateResponsesJSONToChatPreservesOpaqueFunctionArguments(t *testing
 	if call.Function.Arguments != "{not-json" {
 		t.Fatalf("arguments = %q", call.Function.Arguments)
 	}
-	if _, err := store.Resolve(responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}, responsesChatReplayAssistantProjection{Content: result.Response.Choices[0].Message.Content, Calls: []responsesChatReplayProjectedCall{{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments}}}); err != nil {
-		t.Fatalf("resolve opaque arguments: %v", err)
+	// Opaque (non-JSON) arguments must survive the carrier untouched, the same
+	// obligation the store round-trip used to check.
+	signature, err := encodeReasoningCarrier(result.CarriedReasoning)
+	if err != nil {
+		t.Fatalf("encode carrier: %v", err)
+	}
+	decoded, ok := decodeReasoningCarrier(signature)
+	if !ok || len(decoded) != len(result.CarriedReasoning) {
+		t.Fatalf("opaque arguments did not survive the carrier: ok=%v", ok)
 	}
 }
 
@@ -322,10 +340,23 @@ func TestTranslateResponsesJSONToChatRetainsUsageWhenReplayPublishFails(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{MaxGroupBytes: 1})
-	_, err = translateResponsesJSONToChat(body, responsesChatResponseOptions{ReplayStore: store, ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
-	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Usage == nil || executionErr.Usage.TotalTokens != 29 {
-		t.Fatalf("error = %#v", err)
+	// This used to force a replay-publish failure (MaxGroupBytes: 1) and assert
+	// usage still rode out on the error. Nothing publishes any more -- the turn
+	// is carried by the client -- so a store limit cannot fail a request at
+	// all. That is the point: the failure mode is gone, not merely handled.
+	//
+	// The surviving obligation is that a successful turn reports usage AND
+	// hands back something for the client to carry.
+	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
+		ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"},
+	})
+	if err != nil {
+		t.Fatalf("a store limit must no longer be able to fail a turn: %v", err)
+	}
+	if result.Usage == nil || result.Usage.TotalTokens != 29 {
+		t.Fatalf("usage = %#v", result.Usage)
+	}
+	if len(result.CarriedReasoning) == 0 {
+		t.Fatal("no carried reasoning on a tool-call turn")
 	}
 }

@@ -58,12 +58,16 @@ type chatExecutionResult struct {
 	Response       *http.Response
 	Completion     *models.OpenAIResponse
 	CompletionBody []byte
-	Stream         *chatStreamEventStream
-	Headers        http.Header
-	Usage          *models.OpenAIUsage
-	IncludeUsage   bool
-	Backend        chatBackend
-	route          resolvedChatRoute
+	// CarriedReasoning is this turn's Responses output array, to be emitted as
+	// a thinking block so the client holds it for the next turn. Internal and
+	// never serialised, like the rest of this struct.
+	CarriedReasoning []json.RawMessage
+	Stream           *chatStreamEventStream
+	Headers          http.Header
+	Usage            *models.OpenAIUsage
+	IncludeUsage     bool
+	Backend          chatBackend
+	route            resolvedChatRoute
 }
 
 func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
@@ -268,6 +272,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	result.Response = nil
 	result.Completion = converted.Response
 	result.CompletionBody = converted.Body
+	result.CarriedReasoning = converted.CarriedReasoning
 	result.Usage = converted.Usage
 	return result, nil
 }

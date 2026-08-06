@@ -69,15 +69,23 @@ func TestTranslateResponsesJSONToChatPreservesPresentFunctionArgumentsStrings(t 
 			if call.Function.Arguments != tt.want {
 				t.Fatalf("arguments = %q, want %q", call.Function.Arguments, tt.want)
 			}
-			if _, err := store.Resolve(route, responsesChatReplayAssistantProjection{
-				Content: choice.Message.Content,
-				Calls: []responsesChatReplayProjectedCall{{
-					ID:        call.ID,
-					Name:      call.Function.Name,
-					Arguments: call.Function.Arguments,
-				}},
-			}); err != nil {
-				t.Fatalf("resolve replay: %v", err)
+			// Resolving through the store proved the arguments survived a
+			// round trip. The carrier is the round trip now: the same output
+			// items must come back byte-identically, because Copilot will try
+			// to decrypt the encrypted_content inside them.
+			signature, err := encodeReasoningCarrier(result.CarriedReasoning)
+			if err != nil {
+				t.Fatalf("encode carrier: %v", err)
+			}
+			decoded, ok := decodeReasoningCarrier(signature)
+			if !ok || len(decoded) != len(result.CarriedReasoning) {
+				t.Fatalf("carrier did not round-trip: ok=%v got=%d want=%d",
+					ok, len(decoded), len(result.CarriedReasoning))
+			}
+			for i := range decoded {
+				if string(decoded[i]) != string(result.CarriedReasoning[i]) {
+					t.Fatalf("item %d changed in transit", i)
+				}
 			}
 		})
 	}

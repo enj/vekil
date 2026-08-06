@@ -1713,7 +1713,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			anthropicResp := translateOpenAIToAnthropicForRequest(oaiResp, &responseReq)
+			anthropicResp := prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(oaiResp, &responseReq), result.CarriedReasoning)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
@@ -1731,7 +1732,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			w.Header().Set("Content-Type", "application/json")
-			return json.NewEncoder(w).Encode(translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq))
+			return json.NewEncoder(w).Encode(prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq), result.CarriedReasoning))
 		},
 	})
 	if err != nil {

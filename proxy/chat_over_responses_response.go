@@ -25,6 +25,10 @@ type responsesChatJSONResult struct {
 	Response *models.OpenAIResponse
 	Body     []byte
 	Usage    *models.OpenAIUsage
+	// CarriedReasoning is this turn's Responses output array, destined for a
+	// thinking block on the Anthropic response so the CLIENT holds it. Empty
+	// when the turn made no tool calls and there is nothing to replay.
+	CarriedReasoning []json.RawMessage
 }
 
 type responsesChatJSONEnvelope struct {
@@ -74,6 +78,9 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	content := strings.Builder{}
 	refusal := strings.Builder{}
 	functionCalls := make([]responsesChatParsedFunctionCall, 0)
+	// This turn's Responses output array, handed to the client in a thinking
+	// block so it can replay it next turn. Nil when there are no tool calls.
+	var carriedReasoning []json.RawMessage
 	sawIncompleteFunctionCall := false
 	if !options.UsageOnly {
 		for index, rawItem := range envelope.Output {
@@ -139,36 +146,22 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	}
 	chatToolCalls := make([]models.OpenAIToolCall, 0, len(functionCalls))
 	if len(functionCalls) > 0 {
-		if options.ReplayStore == nil {
-			replayErr := newChatServerError("responses_replay_unavailable", "Responses replay storage is unavailable")
-			attachChatExecutionErrorUsage(replayErr, usage)
-			return responsesChatJSONResult{}, replayErr
-		}
+		// No ReplayStore check any more: carrying the items to the client needs
+		// no storage, so a turn can no longer fail for want of it.
+		//
 		// Chat-style surfaces intentionally do not run command_rewrite; they preserve
 		// upstream arguments and only capture tool context for later output reduction.
-		publishCalls := make([]responsesChatReplayPublishCall, len(functionCalls))
-		for i, call := range functionCalls {
-			publishCalls[i] = responsesChatReplayPublishCall{
-				UpstreamCallID:   call.UpstreamCallID,
-				Name:             call.Name,
-				VisibleArguments: call.Arguments,
-				OutputItemIndex:  call.OutputItemIndex,
-			}
-		}
-		published, err := options.ReplayStore.Publish(responsesChatReplayPublishRequest{
-			Route:            options.ReplayRoute,
-			AssistantContent: contentRaw,
-			OutputItems:      envelope.Output,
-			Calls:            publishCalls,
-		})
-		if err != nil {
-			replayErr := mapResponsesChatReplayPublishError(err)
-			attachChatExecutionErrorUsage(replayErr, usage)
-			return responsesChatJSONResult{}, replayErr
-		}
-		for _, call := range published.Projection.Calls {
+		//
+		// Carry the output items back to the client instead of storing them,
+		// and pass Copilot's own call ids through instead of minting proxy
+		// ids. Minting only existed to key the store; with no store there is
+		// nothing to key, and an upstream id is already a valid tool_use id
+		// (verified: Copilot accepts its own, a stale call_vekil_, and a
+		// fabricated id alike).
+		carriedReasoning = envelope.Output
+		for _, call := range functionCalls {
 			chatToolCalls = append(chatToolCalls, models.OpenAIToolCall{
-				ID:       call.ID,
+				ID:       call.UpstreamCallID,
 				Type:     "function",
 				Function: models.OpenAIFunctionCall{Name: call.Name, Arguments: call.Arguments},
 			})
@@ -203,7 +196,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if len(encoded) > responsesChatMaxJSONBodyBytes {
 		return responsesChatJSONResult{}, newChatServerError("chat_body_too_large", "converted Chat response exceeds the JSON limit")
 	}
-	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage}, nil
+	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage, CarriedReasoning: carriedReasoning}, nil
 }
 
 func validateResponsesChatMessageStatus(responseStatus, messageStatus string) error {

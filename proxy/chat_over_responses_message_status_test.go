@@ -254,13 +254,16 @@ func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
 			if choice.FinishReason == nil || *choice.FinishReason != tt.wantFinish || len(choice.Message.ToolCalls) != tt.wantCalls {
 				t.Fatalf("choice = %#v, want finish %q and %d calls", choice, tt.wantFinish, tt.wantCalls)
 			}
-			stats := store.Stats()
-			if tt.wantCalls > 0 {
-				if stats.Groups != 1 || stats.Calls != tt.wantCalls {
-					t.Fatalf("replay stats = %#v", stats)
-				}
-			} else if stats.Groups != 0 || stats.Calls != 0 {
-				t.Fatalf("replay stats = %#v", stats)
+			// Store stats used to prove the turn was recorded. Nothing is
+			// recorded server-side now; the equivalent obligation is that a
+			// tool-call turn hands the client something to replay, and a
+			// non-tool turn hands it nothing.
+			if tt.wantCalls > 0 && len(result.CarriedReasoning) == 0 {
+				t.Fatal("tool-call turn carried no reasoning for the next turn")
+			}
+			if tt.wantCalls == 0 && len(result.CarriedReasoning) != 0 {
+				t.Fatalf("non-tool turn carried %d items; nothing to replay",
+					len(result.CarriedReasoning))
 			}
 		})
 	}
