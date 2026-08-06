@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -116,34 +117,48 @@ func TestReasoningCarrierBlockShape(t *testing.T) {
 	}
 }
 
-// Compression is what keeps the carrier affordable: the signature rides in
-// every subsequent request, so a real turn must not balloon.
+// Size is a real design constraint, and compression does NOT rescue it.
 //
-// Sized from a measured live item (2096-char encrypted_content, 424-char id)
-// rather than the toy fixture — at toy sizes deflate+base64 overhead exceeds
-// the payload, which is true but says nothing about the real cost.
-func TestReasoningCarrierCompressesRealisticPayload(t *testing.T) {
-	items := []json.RawMessage{
-		json.RawMessage(`{"type":"reasoning","id":"` + strings.Repeat("k", 424) +
-			`","encrypted_content":"` + strings.Repeat("Q", 2096) + `","content":[],"summary":[]}`),
-		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_1","name":"lookup","arguments":"{}"}`),
+// encrypted_content is base64 ciphertext: high entropy, incompressible.
+// Measured with random bytes at the shape of a live item (1572 raw bytes ->
+// ~2096 base64 chars, plus a 424-char id): raw 2685 -> signature 2763, i.e.
+// 103% of raw. Deflate recovers nothing and base64url re-expands by ~3%.
+//
+// An earlier version of this test used strings.Repeat and "proved" 7% of raw.
+// That passed for entirely the wrong reason -- repeated characters compress
+// almost perfectly and are nothing like ciphertext. The honest property to
+// pin is the growth RATE, because the signature rides in every subsequent
+// request: ~2.1 KB per reasoning item, so a 50-turn tool session carries
+// ~103 KB. That is what makes the trim policy load-bearing rather than
+// optional.
+func TestReasoningCarrierSizeGrowsWithCiphertext(t *testing.T) {
+	item := func() json.RawMessage {
+		buf := make([]byte, 1572)
+		if _, err := rand.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+		return json.RawMessage(`{"type":"reasoning","encrypted_content":"` +
+			base64.StdEncoding.EncodeToString(buf) + `"}`)
 	}
-	raw, _ := json.Marshal(items)
-	signature, err := encodeReasoningCarrier(items)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
+	one, _ := encodeReasoningCarrier([]json.RawMessage{item()})
+	ten := make([]json.RawMessage, 0, 10)
+	for i := 0; i < 10; i++ {
+		ten = append(ten, item())
 	}
-	if len(signature) >= len(raw) {
-		t.Fatalf("signature (%d) did not beat raw JSON (%d)", len(signature), len(raw))
-	}
-	t.Logf("raw=%d signature=%d (%.0f%% of raw)", len(raw), len(signature),
-		float64(len(signature))*100/float64(len(raw)))
+	many, _ := encodeReasoningCarrier(ten)
 
-	// And it must still round-trip byte-identically at this size.
-	decoded, ok := decodeReasoningCarrier(signature)
-	if !ok || len(decoded) != len(items) || string(decoded[0]) != string(items[0]) {
-		t.Fatal("realistic payload did not round-trip byte-identically")
+	perItem := len(many) / 10
+	if perItem < 1500 || perItem > 3000 {
+		t.Fatalf("per-item carrier cost = %d bytes; expected ~2.1 KB for ciphertext. "+
+			"If this dropped sharply the fixture stopped being high-entropy and the "+
+			"test is measuring nothing.", perItem)
 	}
+	if len(many) < len(one)*8 {
+		t.Fatalf("10 items (%d) did not grow roughly linearly from 1 (%d); "+
+			"ciphertext must not be compressing away", len(many), len(one))
+	}
+	t.Logf("per reasoning item ~%d bytes; 50-turn session would carry ~%d KB",
+		perItem, perItem*50/1024)
 }
 
 func min(a, b int) int {
