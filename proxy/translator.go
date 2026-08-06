@@ -221,7 +221,19 @@ func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, erro
 			})
 
 		case "thinking", "redacted_thinking":
-			// skip thinking blocks
+			// Correctly skipped HERE, but read elsewhere -- see
+			// extractCarriedReasoning in reasoning_carrier.go.
+			//
+			// This function builds the Chat message body, and Chat Completions
+			// has no field for thinking, so there is nowhere to put one. A
+			// foreign thinking block (genuine Anthropic reasoning from a turn
+			// on an Anthropic model) is also useless to a Responses upstream.
+			//
+			// vekil's OWN reasoning state does ride in a thinking block, but as
+			// transport rather than content: it is extracted from the request
+			// in a separate pass and threaded through chatExecutionOptions,
+			// which is never serialised. So the carrier survives even though
+			// this drops the block, and the two do not conflict.
 
 		default:
 			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
