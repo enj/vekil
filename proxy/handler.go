@@ -293,8 +293,6 @@ type ProxyHandler struct {
 	policyPreflightPermitOnce        sync.Once
 	policyPreflightPermit            chan struct{}
 	policyPreflightPending           atomic.Bool
-	responsesChatReplayMu            sync.Mutex
-	responsesChatReplay              *responsesChatReplayStore
 	geminiCounts                     geminiCountTokensCache
 	stats                            *statsCollector
 	stateBindingsOnce                sync.Once
@@ -322,33 +320,6 @@ func (h *ProxyHandler) lifecycleContext() context.Context {
 	}
 	h.initializeLifecycle()
 	return h.lifecycleCtx
-}
-
-func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
-	if h == nil {
-		return nil
-	}
-	h.responsesChatReplayMu.Lock()
-	defer h.responsesChatReplayMu.Unlock()
-	if h.responsesChatReplay == nil && !h.ShuttingDown() {
-		h.responsesChatReplay = newResponsesChatReplayStore()
-	}
-	return h.responsesChatReplay
-}
-
-// closeResponsesChatReplayStore clears process-local tool replay only after
-// graceful HTTP shutdown has drained request handlers. Closing it in
-// BeginShutdown would race in-flight Responses-backed streams publishing their
-// terminal tool calls and misclassify local shutdown as a provider failure.
-func (h *ProxyHandler) closeResponsesChatReplayStore() {
-	if h == nil {
-		return
-	}
-	h.responsesChatReplayMu.Lock()
-	defer h.responsesChatReplayMu.Unlock()
-	if h.responsesChatReplay != nil {
-		_ = h.responsesChatReplay.Close()
-	}
 }
 
 // BeginShutdown idempotently cancels proxy-owned upstream work. Existing and
@@ -485,7 +456,6 @@ func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) (err error) {
 	// handler goroutines unwinding from lifecycle cancellation.
 	defer func() {
 		if err == nil && h.ShuttingDown() && (ctx == nil || ctx.Err() == nil) {
-			h.closeResponsesChatReplayStore()
 		}
 	}()
 	h.lifecycleWorkersMu.Lock()
@@ -863,7 +833,6 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		streamingUpstreamTimeout:        streamingUpstreamTimeout,
 		chatRoutes:                      newChatRouteDiscoveryCache(),
 		policyRoutingMode:               PolicyRoutingModeOff,
-		responsesChatReplay:             newResponsesChatReplayStore(),
 		log:                             log,
 		stats:                           newStatsCollector(),
 	}

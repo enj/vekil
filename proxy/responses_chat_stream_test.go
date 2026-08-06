@@ -107,14 +107,9 @@ func streamChunkText(t *testing.T, chunk models.OpenAIStreamChunk) string {
 
 func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
-	route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
 		PublicModel:      "gpt-public",
-		ReplayStore:      store,
-		ReplayRoute:      route,
 		PrecommitTimeout: time.Second,
 	})
 	if err != nil {
@@ -169,11 +164,8 @@ func TestResponsesChatStream_ImmediateFailureBeforeCommit(t *testing.T) {
 
 func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-		PublicModel: "gpt-public", ReplayStore: store,
-		ReplayRoute:      responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		PublicModel: "gpt-public", ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		PrecommitTimeout: time.Second,
 	})
 	if err != nil {
@@ -507,7 +499,10 @@ func TestResponsesChatStream_EnforcesCumulativeReplayLimitsBeforeTerminal(t *tes
 		}
 	}
 	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway || executionErr.Code != "responses_replay_state_too_large" {
+	// The guard still fires; only its error shape changed. These limits were
+	// the replay store's per-group caps and now stand alone as per-stream DoS
+	// guards, so the error is no longer store-flavoured.
+	if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway || executionErr.Code != "unsupported_responses_output" {
 		t.Fatalf("error = %#v", err)
 	}
 }
@@ -663,11 +658,8 @@ func TestResponsesChatStream_DoesNotExposeIncompleteFunctionCall(t *testing.T) {
 		encoded, _ := json.Marshal(payload)
 		fmt.Fprintf(&rewritten, "event: %s\ndata: %s\n\n", eventName, encoded)
 	}
-	store := newResponsesChatReplayStore()
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(strings.NewReader(rewritten.String())), responsesChatStreamConfig{
 		PublicModel:      "gpt-public",
-		ReplayStore:      store,
-		ReplayRoute:      responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		PrecommitTimeout: time.Second,
 	})
 	if err != nil {
@@ -684,9 +676,7 @@ func TestResponsesChatStream_DoesNotExposeIncompleteFunctionCall(t *testing.T) {
 	if len(chunks) < 2 || chunks[len(chunks)-2].Choices[0].FinishReason == nil || *chunks[len(chunks)-2].Choices[0].FinishReason != "length" {
 		t.Fatalf("chunks = %#v", chunks)
 	}
-	if stats := store.Stats(); stats.Groups != 0 {
-		t.Fatalf("replay stats = %#v", stats)
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestResponsesChatSSEDecoderScansLargePendingEventIncrementally(t *testing.T) {
@@ -829,14 +819,14 @@ func TestResponsesChatStream_ChargesPriorVisibleTextWhenToolAppears(t *testing.T
 		t.Fatal(err)
 	}
 	chunk := strings.Repeat("x", 1024)
-	for i := 0; i < responsesChatReplayMaxGroupBytes/len(chunk)+1; i++ {
+	for i := 0; i < responsesChatStreamMaxBytes/len(chunk)+1; i++ {
 		if _, err := state.handleOutputTextDelta([]byte(fmt.Sprintf(`{"item_id":"d%d","output_index":0,"content_index":0,"delta":%q}`, i, chunk))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	_, err := state.handleOutputItemAdded([]byte(`{"output_index":1,"item":{"type":"function_call","id":"f","call_id":"call","name":"tool","arguments":""}}`))
 	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "responses_replay_state_too_large" {
+	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 		t.Fatalf("error = %#v", err)
 	}
 }

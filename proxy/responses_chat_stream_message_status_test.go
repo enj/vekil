@@ -323,11 +323,8 @@ func TestResponsesChatStreamValidatesTerminalReasoningStatus(t *testing.T) {
 }
 
 func TestResponsesChatStreamInvalidReasoningStatusDoesNotPublishReplay(t *testing.T) {
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
 	state := newResponsesChatStreamState(responsesChatStreamConfig{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		Now:         time.Now,
 	})
@@ -421,9 +418,7 @@ func TestResponsesChatStreamInvalidReasoningStatusDoesNotPublishReplay(t *testin
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 		t.Fatalf("error = %#v, want unsupported_responses_output", err)
 	}
-	if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
-		t.Fatalf("replay state was published before reasoning validation: %#v", stats)
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
@@ -454,11 +449,8 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := newResponsesChatReplayStore()
-			t.Cleanup(func() { _ = store.Close() })
 			state := newResponsesChatStreamState(responsesChatStreamConfig{
 				PublicModel: "gpt-public",
-				ReplayStore: store,
 				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 				Now:         time.Now,
 			})
@@ -512,9 +504,7 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 				if !errors.As(doneErr, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 					t.Fatalf("output item done error = %#v, want unsupported_responses_output", doneErr)
 				}
-				if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
-					t.Fatalf("replay stats = %#v", stats)
-				}
+				// (store removed; nothing recorded server-side to assert on)
 				return
 			}
 			if doneErr != nil {
@@ -557,9 +547,7 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 				if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 					t.Fatalf("terminal error = %#v, want unsupported_responses_output", err)
 				}
-				if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
-					t.Fatalf("replay stats = %#v", stats)
-				}
+				// (store removed; nothing recorded server-side to assert on)
 				return
 			}
 			if err != nil {
@@ -578,7 +566,6 @@ func TestResponsesChatStreamValidatesTerminalFunctionCallStatus(t *testing.T) {
 			}
 			// The store no longer records anything; the equivalent obligation is
 			// that the stream emitted a carrier for the client to replay.
-			_ = store
 		})
 	}
 }

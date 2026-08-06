@@ -16,7 +16,6 @@ const responsesChatMaxJSONBodyBytes = 16 << 20
 
 type responsesChatResponseOptions struct {
 	PublicModel string
-	ReplayStore *responsesChatReplayStore
 	ReplayRoute responsesChatReplayRoute
 	UsageOnly   bool
 }
@@ -397,17 +396,6 @@ func parseResponsesChatFunctionCall(raw json.RawMessage, outputIndex int) (respo
 		Status:           call.Status,
 		OutputItemIndex:  outputIndex,
 	}, nil
-}
-
-func mapResponsesChatReplayPublishError(err error) error {
-	switch err.(type) {
-	case *responsesChatReplayTooLargeError:
-		return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_replay_state_too_large", Message: "Responses-backed tool replay state exceeds configured limits."}
-	case *responsesChatReplayClosedError:
-		return &chatExecutionError{StatusCode: http.StatusServiceUnavailable, Type: "server_error", Code: responsesChatReplayClosedCode, Message: responsesChatReplayClosedMessage}
-	default:
-		return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_replay_state_invalid", Message: "Upstream returned invalid Responses tool replay state."}
-	}
 }
 
 func responsesChatFailedExecutionError(failure *struct {

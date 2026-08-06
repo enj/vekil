@@ -28,7 +28,11 @@ func BenchmarkChatOverResponsesParallelTools(b *testing.B) {
 	benchmarkResponsesChatStream(b, fixture, true)
 }
 
+// withReplay used to toggle a replay store. There is no store, so the
+// parameter is retained only to keep both benchmark entry points valid;
+// they now measure the same path.
 func benchmarkResponsesChatStream(b *testing.B, fixture []byte, withReplay bool) {
+	_ = withReplay
 	b.Helper()
 	b.ReportAllocs()
 	b.SetBytes(int64(len(fixture)))
@@ -37,12 +41,8 @@ func benchmarkResponsesChatStream(b *testing.B, fixture []byte, withReplay bool)
 	var chunkCount int
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		var store *responsesChatReplayStore
-		if withReplay {
-			store = newResponsesChatReplayStore()
-		}
 		stream, err := prepareResponsesChatStream(ctx, io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-			PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route, PrecommitTimeout: time.Second,
+			PublicModel: "gpt-public", ReplayRoute: route, PrecommitTimeout: time.Second,
 		})
 		if err != nil {
 			b.Fatal(err)
@@ -53,9 +53,6 @@ func benchmarkResponsesChatStream(b *testing.B, fixture []byte, withReplay bool)
 		})
 		if err != nil {
 			b.Fatal(err)
-		}
-		if store != nil {
-			_ = store.Close()
 		}
 	}
 	benchmarkResponsesChatChunkCount = chunkCount

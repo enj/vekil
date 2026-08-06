@@ -19,10 +19,8 @@ func TestTranslateResponsesJSONToChatRequiresCompletedFunctionArgumentsString(t 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := []byte(`{"id":"resp-invalid-arguments","status":"completed","output":[{"type":"function_call","call_id":"upstream-call","name":"lookup","status":"completed"` + tt.argumentsField + `}]}`)
-			store := newResponsesChatReplayStore()
 			_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt",
-				ReplayStore: store,
 				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"},
 			})
 
@@ -30,9 +28,7 @@ func TestTranslateResponsesJSONToChatRequiresCompletedFunctionArgumentsString(t 
 			if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 				t.Errorf("translateResponsesJSONToChat() error = %#v, want unsupported_responses_output", err)
 			}
-			if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
-				t.Errorf("replay state published for invalid arguments: %#v", stats)
-			}
+			// (store removed; nothing recorded server-side to assert on)
 		})
 	}
 }
@@ -50,11 +46,9 @@ func TestTranslateResponsesJSONToChatPreservesPresentFunctionArgumentsStrings(t 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := []byte(`{"id":"resp-valid-arguments","status":"completed","output":[{"type":"function_call","call_id":"upstream-call","name":"lookup","arguments":` + tt.argumentsJSON + `,"status":"completed"}]}`)
-			store := newResponsesChatReplayStore()
 			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt", UpstreamModel: "gpt"}
 			result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt",
-				ReplayStore: store,
 				ReplayRoute: route,
 			})
 			if err != nil {

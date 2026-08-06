@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +23,6 @@ func newChatInvalidRequest(param, message string) *chatExecutionError {
 
 type responsesChatRequestOptions struct {
 	UpstreamModel       string
-	ReplayStore         *responsesChatReplayStore
 	ReplayRoute         responsesChatReplayRoute
 	MinimumOutputTokens int
 	DropSamplingParams  bool
@@ -513,42 +511,6 @@ func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {
 		indices[callID] = index
 	}
 	return indices, nil
-}
-
-func resolveResponsesChatReplay(store *responsesChatReplayStore, route responsesChatReplayRoute, projection responsesChatReplayAssistantProjection) (responsesChatReplayResolution, error) {
-	resolution, err := store.Resolve(route, projection)
-	var mismatch *responsesChatReplayProjectionError
-	if !errors.As(err, &mismatch) || !replayContentIsNullOrEmpty(projection.Content) {
-		return resolution, err
-	}
-	alternate := json.RawMessage(`""`)
-	if bytes.Equal(bytes.TrimSpace(projection.Content), []byte(`""`)) {
-		alternate = json.RawMessage("null")
-	}
-	projection.Content = alternate
-	return store.Resolve(route, projection)
-}
-
-func replayContentIsNullOrEmpty(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`))
-}
-
-func mapResponsesChatReplayResolveError(err error) error {
-	var replayCode interface{ ReplayCode() string }
-	if errors.As(err, &replayCode) {
-		switch replayCode.ReplayCode() {
-		case responsesChatReplayMissingCode:
-			return missingResponsesChatReplayError()
-		case responsesChatReplayMixedCode:
-			return replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
-		case responsesChatReplayProjectionCode:
-			return replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
-		case responsesChatReplayClosedCode:
-			return &chatExecutionError{StatusCode: http.StatusServiceUnavailable, Type: "server_error", Code: responsesChatReplayClosedCode, Param: "messages", Message: responsesChatReplayClosedMessage}
-		}
-	}
-	return replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 }
 
 func replayChatExecutionError(code, message string) *chatExecutionError {

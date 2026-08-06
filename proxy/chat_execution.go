@@ -191,7 +191,6 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
-		ReplayStore:         h.responsesChatReplayStore(),
 		ReplayRoute:         replayRoute,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
@@ -238,7 +237,6 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	if plan.Stream {
 		stream, streamErr := translateResponsesSSEToChat(ctx, resp.Body, responsesChatResponseOptions{
 			PublicModel: route.publicModel,
-			ReplayStore: h.responsesChatReplayStore(),
 			ReplayRoute: replayRoute,
 		})
 		if streamErr != nil {
@@ -261,7 +259,6 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	converted, err := translateResponsesJSONToChat(responseBody, responsesChatResponseOptions{
 		PublicModel: route.publicModel,
-		ReplayStore: h.responsesChatReplayStore(),
 		ReplayRoute: replayRoute,
 		UsageOnly:   options.ResponsesUsageOnly,
 	})

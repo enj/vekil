@@ -763,7 +763,6 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
-			ReplayStore:         h.responsesChatReplayStore(),
 			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
@@ -852,7 +851,6 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 
 	responseOptions := responsesChatResponseOptions{
 		PublicModel: route.public.id,
-		ReplayStore: h.responsesChatReplayStore(),
 		ReplayRoute: explicitResponsesChatReplayRoute(route, target),
 		UsageOnly:   options.ResponsesUsageOnly,
 	}

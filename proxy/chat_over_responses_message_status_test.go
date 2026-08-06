@@ -140,8 +140,6 @@ func TestTranslateResponsesJSONToChatValidatesReasoningStatusAgainstEnvelope(t *
 }
 
 func TestTranslateResponsesJSONToChatInvalidReasoningStatusDoesNotPublishReplay(t *testing.T) {
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
 	envelope := map[string]any{
 		"id":         "resp-invalid-reasoning-replay",
 		"created_at": int64(1_700_000_000),
@@ -171,16 +169,13 @@ func TestTranslateResponsesJSONToChatInvalidReasoningStatusDoesNotPublishReplay(
 
 	_, err = translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 		t.Fatalf("error = %#v, want unsupported_responses_output", err)
 	}
-	if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
-		t.Fatalf("replay state was published before reasoning validation: %#v", stats)
-	}
+	// (store removed; nothing is recorded server-side to assert on)
 }
 
 func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
@@ -230,11 +225,8 @@ func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			store := newResponsesChatReplayStore()
-			t.Cleanup(func() { _ = store.Close() })
 			result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 				PublicModel: "gpt-public",
-				ReplayStore: store,
 				ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 			})
 			if tt.wantError {
@@ -242,9 +234,7 @@ func TestTranslateResponsesJSONToChatValidatesFunctionCallStatus(t *testing.T) {
 				if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_output" {
 					t.Fatalf("error = %#v, want unsupported_responses_output", err)
 				}
-				if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
-					t.Fatalf("replay stats = %#v", stats)
-				}
+				// (store removed; nothing is recorded server-side to assert on)
 				return
 			}
 			if err != nil {

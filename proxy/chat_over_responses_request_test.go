@@ -344,9 +344,8 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newResponsesChatReplayStore()
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	first, err := translateResponsesJSONToChat(fixture, responsesChatResponseOptions{PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route})
+	first, err := translateResponsesJSONToChat(fixture, responsesChatResponseOptions{PublicModel: "gpt-public", ReplayRoute: route})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +364,7 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 			},
 		}
 		body, _ := json.Marshal(request)
-		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route})
+		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayRoute: route})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -389,7 +388,7 @@ func TestTranslateChatRequestToResponsesRestoresReplayGroups(t *testing.T) {
 			},
 		}
 		body, _ := json.Marshal(request)
-		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route})
+		plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{UpstreamModel: "gpt-upstream", ReplayRoute: route})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -568,7 +567,7 @@ func TestTranslateChatRequestToResponsesRejectsNullArgumentsAndToolRefusal(t *te
 
 func TestTranslateChatRequestToResponsesRejectsRefusalOnReplayToolMessage(t *testing.T) {
 	body := []byte(`{"model":"gpt","messages":[{"role":"assistant","content":"","refusal":"tampered","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`)
-	_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: newResponsesChatReplayStore()})
+	_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Param != "messages[0].refusal" {
 		t.Fatalf("error = %#v", err)

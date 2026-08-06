@@ -17,6 +17,13 @@ import (
 )
 
 const (
+	// Per-stream accumulation guards, inherited from the replay store's
+	// per-group limits. The store is gone; these still bound what one stream
+	// can build up from an upstream that misbehaves.
+	responsesChatStreamMaxItems = 256
+	responsesChatStreamMaxCalls = 128
+	responsesChatStreamMaxBytes = 2 << 20
+
 	responsesChatPrecommitTimeout  = responsesPrecommitPeekTimeout
 	responsesChatPrecommitMaxBytes = responsesPrecommitMaxPeekBytes
 	responsesChatMaxSSEEventBytes  = openAIStreamScannerMaxBuffer
@@ -25,7 +32,6 @@ const (
 
 type responsesChatStreamConfig struct {
 	PublicModel string
-	ReplayStore *responsesChatReplayStore
 	ReplayRoute responsesChatReplayRoute
 
 	PrecommitTimeout  time.Duration
@@ -75,7 +81,6 @@ func (c *responsesChatStreamControl) closeBody() {
 func translateResponsesSSEToChat(ctx context.Context, body io.ReadCloser, options responsesChatResponseOptions) (*chatStreamEventStream, error) {
 	return prepareResponsesChatStream(ctx, body, responsesChatStreamConfig{
 		PublicModel: options.PublicModel,
-		ReplayStore: options.ReplayStore,
 		ReplayRoute: options.ReplayRoute,
 	})
 }
@@ -658,8 +663,9 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 	if err := json.Unmarshal(data, &event); err != nil || event.OutputIndex == nil || *event.OutputIndex < 0 || strings.TrimSpace(event.Item.ID) == "" {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses output item is malformed")
 	}
-	if len(s.itemsByIndex) >= responsesChatReplayMaxItems {
-		return responsesChatStreamTransition{}, mapResponsesChatReplayPublishError(&responsesChatReplayTooLargeError{Limit: responsesChatReplayLimitItems, Actual: len(s.itemsByIndex) + 1, Maximum: responsesChatReplayMaxItems})
+	if len(s.itemsByIndex) >= responsesChatStreamMaxItems {
+		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output",
+			"Responses stream exceeded the per-turn output-item limit")
 	}
 	if err := s.chargeReplayBytes(64); err != nil {
 		return responsesChatStreamTransition{}, err
@@ -675,8 +681,8 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		}
 		s.messagesByIndex[*event.OutputIndex] = &responsesChatMessageState{outputIndex: *event.OutputIndex, parts: make(map[int]*responsesChatTextPart)}
 	case "function_call":
-		if len(s.tools) >= responsesChatReplayMaxCalls {
-			return responsesChatStreamTransition{}, mapResponsesChatReplayPublishError(&responsesChatReplayTooLargeError{Limit: responsesChatReplayLimitCalls, Actual: len(s.tools) + 1, Maximum: responsesChatReplayMaxCalls})
+		if len(s.tools) >= responsesChatStreamMaxCalls {
+			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses stream exceeded the per-turn tool-call limit")
 		}
 		if strings.TrimSpace(event.Item.CallID) == "" || strings.TrimSpace(event.Item.Name) == "" {
 			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "function-call output item is malformed")
@@ -725,7 +731,7 @@ func (s *responsesChatStreamState) handleContentPartAdded(data []byte) (response
 	if message == nil || message.done {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "invalid response.content_part.added transition")
 	}
-	if s.contentParts >= responsesChatReplayMaxItems {
+	if s.contentParts >= responsesChatStreamMaxItems {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses stream contains too many content parts")
 	}
 	if err := s.chargeReplayBytes(128 + len(event.Part.Type)); err != nil {
@@ -774,12 +780,12 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 		if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
 			return responsesChatStreamTransition{}, err
 		}
-	} else if s.visibleBytes <= responsesChatReplayMaxGroupBytes {
-		remaining := responsesChatReplayMaxGroupBytes + 1 - s.visibleBytes
+	} else if s.visibleBytes <= responsesChatStreamMaxBytes {
+		remaining := responsesChatStreamMaxBytes + 1 - s.visibleBytes
 		if len(event.Delta) < remaining {
 			s.visibleBytes += len(event.Delta)
 		} else {
-			s.visibleBytes = responsesChatReplayMaxGroupBytes + 1
+			s.visibleBytes = responsesChatStreamMaxBytes + 1
 		}
 	}
 	_, _ = part.digest.Write([]byte(event.Delta))
@@ -914,13 +920,16 @@ func (s *responsesChatStreamState) handleFunctionArgumentsDone(data []byte) (res
 	return responsesChatStreamTransition{}, nil
 }
 
+// chargeReplayBytes bounds how much one stream may accumulate.
+//
+// These were the replay store's per-group limits. The store is gone, but the
+// guard is not vestigial: it still caps what a single stream can build up from
+// upstream, which a broken or hostile provider could otherwise drive without
+// limit. Renamed constants, same numbers, error no longer store-shaped.
 func (s *responsesChatStreamState) chargeReplayBytes(additional int) error {
-	if additional < 0 || additional > responsesChatReplayMaxGroupBytes-s.replayBytes {
-		actual := s.replayBytes + additional
-		if additional < 0 {
-			actual = responsesChatReplayMaxGroupBytes + 1
-		}
-		return mapResponsesChatReplayPublishError(&responsesChatReplayTooLargeError{Limit: responsesChatReplayLimitGroupBytes, Actual: actual, Maximum: responsesChatReplayMaxGroupBytes})
+	if additional < 0 || additional > responsesChatStreamMaxBytes-s.replayBytes {
+		return newChatServerError("unsupported_responses_output",
+			"Responses stream exceeded the per-turn byte limit")
 	}
 	s.replayBytes += additional
 	return nil
@@ -1043,8 +1052,10 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	hasRefusal := false
 	// Chat-style surfaces intentionally do not run command_rewrite; they preserve
 	// upstream arguments and only capture tool context for later output reduction.
-	// Tracks which calls completed; drives exposeTools below.
-	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.tools))
+	// Counts calls that completed; drives exposeTools below. Used to be a
+	// []responsesChatReplayPublishCall feeding the replay store; nothing is
+	// stored now, so only the count matters.
+	completedCalls := 0
 	for outputIndex, raw := range event.Response.Output {
 		var header struct {
 			Type   string `json:"type"`
@@ -1112,9 +1123,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			if !tool.argumentsDone || call.Arguments != tool.arguments.String() {
 				return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "terminal function call does not match streamed arguments")
 			}
-			publishCalls = append(publishCalls, responsesChatReplayPublishCall{
-				UpstreamCallID: call.CallID, Name: call.Name, VisibleArguments: call.Arguments, OutputItemIndex: outputIndex,
-			})
+			completedCalls++
 		case "reasoning":
 			terminalItemStatus := strings.TrimSpace(header.Status)
 			doneStatus, ok := s.reasoningStatusByIndex[outputIndex]
@@ -1141,10 +1150,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	if len(s.tools) > 0 && hasRefusal {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses tool-call turns with refusal content are not supported")
 	}
-	exposeTools := len(publishCalls) > 0 && !s.hasIncompleteTool
-	if !exposeTools {
-		publishCalls = nil
-	}
+	exposeTools := completedCalls > 0 && !s.hasIncompleteTool
 	finishReason, err := responsesChatFinishReason(event.Response.Status, event.Response.IncompleteDetails, exposeTools)
 	if err != nil {
 		return responsesChatStreamTransition{}, err

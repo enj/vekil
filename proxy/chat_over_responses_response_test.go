@@ -44,11 +44,9 @@ func TestTranslateResponsesJSONToChatPublishesFunctionCallReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newResponsesChatReplayStore()
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: route,
 	})
 	if err != nil {
@@ -104,10 +102,8 @@ func TestTranslateResponsesJSONToChatOutputMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		store := newResponsesChatReplayStore()
 		result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 			PublicModel: "gpt-public",
-			ReplayStore: store,
 			ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		})
 		if err != nil {
@@ -190,10 +186,8 @@ func TestTranslateResponsesJSONToChatUsageOnlyDoesNotPublishReplay(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newResponsesChatReplayStore()
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		UsageOnly:   true,
 	})
@@ -203,9 +197,7 @@ func TestTranslateResponsesJSONToChatUsageOnlyDoesNotPublishReplay(t *testing.T)
 	if result.Usage == nil || result.Usage.PromptTokens != 20 {
 		t.Fatalf("usage = %#v", result.Usage)
 	}
-	if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 || stats.TotalBytes != 0 {
-		t.Fatalf("replay stats = %#v", stats)
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestTranslateResponsesJSONToChatRejectsNonterminalToolStatusBeforePublish(t *testing.T) {
@@ -219,19 +211,15 @@ func TestTranslateResponsesJSONToChatRejectsNonterminalToolStatusBeforePublish(t
 	}
 	payload["status"] = "queued"
 	body, _ = json.Marshal(payload)
-	store := newResponsesChatReplayStore()
 	_, err = translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_response_status" {
 		t.Fatalf("error = %#v", err)
 	}
-	if stats := store.Stats(); stats.Groups != 0 {
-		t.Fatalf("replay stats = %#v", stats)
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestTranslateResponsesJSONToChatDoesNotExposeIncompleteFunctionCall(t *testing.T) {
@@ -247,10 +235,8 @@ func TestTranslateResponsesJSONToChatDoesNotExposeIncompleteFunctionCall(t *test
 	payload["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	payload["output"].([]any)[0].(map[string]any)["status"] = "incomplete"
 	body, _ = json.Marshal(payload)
-	store := newResponsesChatReplayStore()
 	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{
 		PublicModel: "gpt-public",
-		ReplayStore: store,
 		ReplayRoute: responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 	})
 	if err != nil {
@@ -260,15 +246,12 @@ func TestTranslateResponsesJSONToChatDoesNotExposeIncompleteFunctionCall(t *test
 	if choice.FinishReason == nil || *choice.FinishReason != "length" || len(choice.Message.ToolCalls) != 0 {
 		t.Fatalf("choice = %#v", choice)
 	}
-	if stats := store.Stats(); stats.Groups != 0 {
-		t.Fatalf("replay stats = %#v", stats)
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestTranslateResponsesJSONToChatPreservesOpaqueFunctionArguments(t *testing.T) {
 	body := []byte(`{"id":"resp-opaque","created_at":1700000000,"status":"completed","output":[{"type":"function_call","id":"item","call_id":"upstream-call","name":"f","arguments":"{not-json","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
-	store := newResponsesChatReplayStore()
-	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{PublicModel: "gpt", ReplayStore: store, ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
+	result, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{PublicModel: "gpt", ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,15 +307,12 @@ func TestResponsesChatCodeOnlyFailuresAreClassified(t *testing.T) {
 
 func TestTranslateResponsesJSONToChatRejectsRefusalWithToolCalls(t *testing.T) {
 	body := []byte(`{"id":"resp-mixed","created_at":1700000000,"status":"completed","output":[{"type":"message","id":"m","status":"completed","role":"assistant","content":[{"type":"refusal","refusal":"no"}]},{"type":"function_call","id":"f","call_id":"call","name":"tool","arguments":"{}","status":"completed"}]}`)
-	store := newResponsesChatReplayStore()
-	_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{ReplayStore: store, ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
+	_, err := translateResponsesJSONToChat(body, responsesChatResponseOptions{ReplayRoute: responsesChatReplayRoute{ProviderID: "p", PublicModel: "gpt", UpstreamModel: "gpt"}})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway {
 		t.Fatalf("error = %#v", err)
 	}
-	if store.Stats().Groups != 0 {
-		t.Fatalf("replay state published")
-	}
+	// (store removed; nothing recorded server-side to assert on)
 }
 
 func TestTranslateResponsesJSONToChatRetainsUsageWhenReplayPublishFails(t *testing.T) {
