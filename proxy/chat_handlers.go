@@ -1155,6 +1155,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
+			CarriedReasoning:    options.CarriedReasoning,
 			ReplayStore:         h.responsesChatReplayStore(),
 			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
@@ -1279,6 +1280,7 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 	result.Response = nil
 	result.Completion = converted.Response
 	result.CompletionBody = converted.Body
+	result.CarriedReasoning = converted.CarriedReasoning
 	result.Usage = converted.Usage
 	return result, nil
 }
@@ -2016,7 +2018,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
-	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, oaiBody)
+	carriedReasoning := extractCarriedReasoning(req.Messages)
+	policyPlan, err := h.planOpenAIChatPolicyWithCarrier(r.Context(), req.Model, oaiBody, 0, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2093,7 +2096,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	responseReq := req
 	responseReq.Model = publicModel
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{}, providerModel)
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{
+		CarriedReasoning: carriedReasoning,
+	}, providerModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2242,7 +2247,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			anthropicResp := translateOpenAIToAnthropicForRequest(oaiResp, &responseReq)
+			anthropicResp := prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(oaiResp, &responseReq), result.carrier())
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
@@ -2260,7 +2266,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			w.Header().Set("Content-Type", "application/json")
-			return json.NewEncoder(w).Encode(translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq))
+			return json.NewEncoder(w).Encode(prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq), result.carrier()))
 		},
 	})
 	if err != nil {
@@ -2334,6 +2341,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	publicModel := req.Model
+	carriedReasoning := extractCarriedReasoning(req.Messages)
 	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)
@@ -2382,7 +2390,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to prepare count_tokens policy request")
 		return
 	}
-	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, policyBody)
+	policyPlan, err := h.planOpenAIChatPolicyWithCarrier(r.Context(), req.Model, policyBody, 0, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2449,7 +2457,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq)
+	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2521,7 +2529,7 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 	return oaiReq, nil
 }
 
-func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest, carried map[string]carriedReplay) (*models.OpenAIResponse, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
@@ -2530,6 +2538,7 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx conte
 		ResponsesMinimumOutputTokens: responsesChatMinimumOutputTokens,
 		ResponsesDropSamplingParams:  true,
 		ResponsesUsageOnly:           true,
+		CarriedReasoning:             carried,
 	}
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, body, chatCompletionsMode{}, options, probeReq.Model)
 	if err != nil {

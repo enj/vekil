@@ -462,8 +462,9 @@ func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolSta
 }
 
 type responsesChatStreamTransition struct {
-	chunks   []models.OpenAIStreamChunk
-	terminal bool
+	chunks           []models.OpenAIStreamChunk
+	terminal         bool
+	carriedReasoning carriedTurn
 }
 
 func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (responsesChatStreamTransition, error) {
@@ -1161,6 +1162,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			attachChatExecutionErrorUsage(replayErr, terminalUsage)
 			return usageFailureTransition, replayErr
 		}
+		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published)
 		proxyByUpstream := make(map[string]string, len(published.Calls))
 		for _, call := range published.Calls {
 			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
@@ -1185,7 +1187,9 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		chunks = append(chunks, s.usageChunk(terminalUsage))
 	}
 	s.terminalSeen = true
-	return responsesChatStreamTransition{chunks: chunks, terminal: true}, nil
+	transition.chunks = chunks
+	transition.terminal = true
+	return transition, nil
 }
 
 func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
@@ -1387,6 +1391,11 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 		}
 		if len(transition.chunks) > 0 {
 			if err := emitChunks(transition.chunks); err != nil {
+				return err
+			}
+		}
+		if len(transition.carriedReasoning.Items) > 0 {
+			if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {
 				return err
 			}
 		}

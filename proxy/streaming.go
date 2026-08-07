@@ -2261,3 +2261,38 @@ func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice, 
 func convertFinishReason(reason string) string {
 	return MapStopReason(&reason)
 }
+
+// TRAILING, unlike the non-streaming path: the items are only known at response.completed.
+func (s *anthropicStreamState) emitCarriedReasoning(turn carriedTurn) bool {
+	signature, err := encodeReasoningCarrier(turn)
+	if err != nil || signature == "" {
+		return true // nothing to carry, or an encode problem: not fatal to the turn
+	}
+	if !s.closeOpenToolBlocks() {
+		return false
+	}
+	index := s.nextBlockIndex
+	s.nextBlockIndex++
+	if !s.emit("content_block_start", models.AnthropicStreamEvent{
+		Type:         "content_block_start",
+		Index:        intVal(index),
+		ContentBlock: &models.ContentBlock{Type: "thinking"},
+	}) {
+		return false
+	}
+	// Clients ignore extra fields on the start frame, so this must be a delta.
+	if !s.emit("content_block_delta", models.AnthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: intVal(index),
+		Delta: &models.AnthropicDelta{
+			Type:      "signature_delta",
+			Signature: signature,
+		},
+	}) {
+		return false
+	}
+	return s.emit("content_block_stop", models.AnthropicStreamEvent{
+		Type:  "content_block_stop",
+		Index: intVal(index),
+	})
+}

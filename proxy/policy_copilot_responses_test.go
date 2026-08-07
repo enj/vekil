@@ -80,8 +80,9 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 				}
 				upstream.mu.Lock()
 				upstream.classifierRequests++
+				signals := upstream.classifierSignals
 				upstream.mu.Unlock()
-				arguments, _ := json.Marshal(upstream.classifierSignals)
+				arguments, _ := json.Marshal(signals)
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"id":         "resp-classifier",
 					"object":     "response",
@@ -196,6 +197,12 @@ func (u *copilotResponsesPolicyUpstream) failNextToolRequest(model string) {
 	defer u.mu.Unlock()
 	u.toolFailureModel = model
 	u.toolFailuresLeft = 1
+}
+
+func (u *copilotResponsesPolicyUpstream) setClassifierSignals(signals policyClassifierSignals) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.classifierSignals = signals
 }
 
 func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
@@ -808,7 +815,7 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 		t.Fatal(err)
 	}
 
-	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body)
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body, nil)
 	if err != nil {
 		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
 	}

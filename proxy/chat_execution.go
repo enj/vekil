@@ -38,18 +38,32 @@ type chatExecutionOptions struct {
 	ResponsesMinimumOutputTokens int
 	ResponsesDropSamplingParams  bool
 	ResponsesUsageOnly           bool
+	CarriedReasoning             map[string]carriedReplay
 }
 
 type chatExecutionResult struct {
-	Response       *http.Response
-	Completion     *models.OpenAIResponse
-	CompletionBody []byte
-	Stream         *chatStreamEventStream
-	Headers        http.Header
-	Usage          *models.OpenAIUsage
-	IncludeUsage   bool
-	Backend        chatBackend
-	route          resolvedChatRoute
+	Response         *http.Response
+	Completion       *models.OpenAIResponse
+	CompletionBody   []byte
+	CarriedReasoning carriedTurn
+	Stream           *chatStreamEventStream
+	Headers          http.Header
+	Usage            *models.OpenAIUsage
+	IncludeUsage     bool
+	Backend          chatBackend
+	route            resolvedChatRoute
+}
+
+// A force-streamed turn -- which non-streaming Anthropic is -- only learns its
+// carrier while the stream is consumed, so it lands there, not on the result.
+func (r chatExecutionResult) carrier() carriedTurn {
+	if len(r.CarriedReasoning.Items) > 0 {
+		return r.CarriedReasoning
+	}
+	if r.Stream != nil {
+		return r.Stream.carriedReasoning
+	}
+	return carriedTurn{}
 }
 
 func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
@@ -173,6 +187,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
+		CarriedReasoning:    options.CarriedReasoning,
 		ReplayStore:         h.responsesChatReplayStore(),
 		ReplayRoute:         replayRoute,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
@@ -255,6 +270,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	result.Response = nil
 	result.Completion = converted.Response
 	result.CompletionBody = converted.Body
+	result.CarriedReasoning = converted.CarriedReasoning
 	result.Usage = converted.Usage
 	return result, nil
 }

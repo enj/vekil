@@ -32,12 +32,15 @@ const (
 	chatStreamEventChunk chatStreamEventKind = iota + 1
 	chatStreamEventSuccess
 	chatStreamEventError
+	// A distinct kind, not a chunk field, so it can never reach a surface.
+	chatStreamEventCarriedReasoning
 )
 
 type chatStreamEvent struct {
-	kind      chatStreamEventKind
-	chunk     models.OpenAIStreamChunk
-	streamErr *chatStreamError
+	kind             chatStreamEventKind
+	chunk            models.OpenAIStreamChunk
+	streamErr        *chatStreamError
+	carriedReasoning carriedTurn
 }
 
 // chatStreamError names the execution error carried by a terminal stream event.
@@ -82,9 +85,10 @@ type chatStreamEventWriter struct {
 // chatStreamEventStream is the consumer side of the canonical Chat event
 // transport. Canceling it releases a producer blocked by the bounded buffer.
 type chatStreamEventStream struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	events <-chan chatStreamEvent
+	ctx              context.Context
+	cancel           context.CancelCauseFunc
+	events           <-chan chatStreamEvent
+	carriedReasoning carriedTurn
 }
 
 func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *chatStreamEventStream) {
@@ -105,6 +109,13 @@ func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *ch
 
 func (w *chatStreamEventWriter) sendChunk(chunk models.OpenAIStreamChunk) error {
 	return w.send(chatStreamEvent{kind: chatStreamEventChunk, chunk: chunk}, false)
+}
+
+func (w *chatStreamEventWriter) sendCarriedReasoning(turn carriedTurn) error {
+	if len(turn.Items) == 0 {
+		return nil
+	}
+	return w.send(chatStreamEvent{kind: chatStreamEventCarriedReasoning, carriedReasoning: turn}, false)
 }
 
 func (w *chatStreamEventWriter) succeed() error {
@@ -185,7 +196,9 @@ func (s *chatStreamEventStream) stop(cause error) {
 	s.cancel(cause)
 }
 
-func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error) (err error) {
+func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error,
+	onCarriedReasoning func(carriedTurn),
+) (err error) {
 	defer func() {
 		if stream != nil {
 			stream.stop(err)
@@ -206,6 +219,13 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 			}
 		case chatStreamEventSuccess:
 			return nil
+		case chatStreamEventCarriedReasoning:
+			if stream != nil {
+				stream.carriedReasoning = event.carriedReasoning
+			}
+			if onCarriedReasoning != nil {
+				onCarriedReasoning(event.carriedReasoning)
+			}
 		case chatStreamEventError:
 			if event.streamErr == nil {
 				return &chatStreamError{StatusCode: http.StatusBadGateway}
@@ -269,7 +289,7 @@ func streamChatEventsToOpenAI(w http.ResponseWriter, stream *chatStreamEventStre
 			return errors.Join(errChatStreamClientWriteFailed, err)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		var streamErr *chatStreamError
 		if errors.As(err, &streamErr) {
@@ -371,7 +391,7 @@ func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options
 	aggregator := newOpenAIResponseAggregatorWithOptions(options)
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		return aggregator.addChunkBounded(chunk)
-	}); err != nil {
+	}, nil); err != nil {
 		return nil, err
 	}
 	if options.rejectInvalidTextDeltas {
@@ -412,6 +432,8 @@ func streamChatEventsToAnthropic(
 			return errChatStreamClientWriteFailed
 		}
 		return nil
+	}, func(turn carriedTurn) {
+		_ = state.emitCarriedReasoning(turn)
 	})
 	if err != nil {
 		var streamErr *chatStreamError
@@ -458,7 +480,7 @@ func streamChatEventsToGemini(w http.ResponseWriter, stream *chatStreamEventStre
 			}
 		}
 		return errChatStreamClientWriteFailed
-	})
+	}, nil)
 	if err != nil {
 		var streamErr *chatStreamError
 		if errors.As(err, &streamErr) {
