@@ -1852,11 +1852,32 @@ func (s *anthropicStreamState) emitCarriedReasoning(outputItems []json.RawMessag
 	}
 	index := s.nextBlockIndex
 	s.nextBlockIndex++
+	// start carries an EMPTY thinking block, exactly as Anthropic does.
 	if !s.emit("content_block_start", models.AnthropicStreamEvent{
 		Type:  "content_block_start",
 		Index: intVal(index),
 		ContentBlock: &models.ContentBlock{
-			Type:      "thinking",
+			Type:     "thinking",
+			Thinking: "",
+		},
+	}) {
+		return false
+	}
+	// The signature arrives as a signature_delta, NOT as a field on
+	// content_block_start.
+	//
+	// Setting it on the start event looks reasonable and silently loses the
+	// payload: clients assemble a thinking block from its deltas and ignore
+	// extra fields on the start frame. Observed live — 41 thinking blocks
+	// reached a real session with no signature at all, so every turn began
+	// without its reasoning while nothing errored. streaming.go's own
+	// pass-through inspector already lists signature_delta beside text_delta
+	// and thinking_delta; this emitter simply was not using it.
+	if !s.emit("content_block_delta", models.AnthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: intVal(index),
+		Delta: &models.AnthropicDelta{
+			Type:      "signature_delta",
 			Signature: signature,
 		},
 	}) {

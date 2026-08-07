@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/models"
@@ -108,5 +110,61 @@ func TestLegacyReplayIDsDegradeInsteadOfWedging(t *testing.T) {
 	}
 	if !sawCall || !sawOutput {
 		t.Fatalf("degraded turn is missing its call/output pair: call=%v output=%v", sawCall, sawOutput)
+	}
+}
+
+// The carrier must reach the client through the frames a client actually
+// reads. This is the bug live traffic caught: the signature was set as a field
+// on content_block_start, which looks right and silently loses the payload —
+// clients assemble a thinking block from its DELTAS and ignore extra fields on
+// the start frame. 41 thinking blocks reached a real session with no signature,
+// so every turn started without its reasoning while nothing errored.
+func TestCarriedReasoningStreamsSignatureAsDelta(t *testing.T) {
+	rec := httptest.NewRecorder()
+	state := newAnthropicStreamState(rec, "gpt-public", "msg_test")
+	if !state.start() {
+		t.Fatal("stream did not start")
+	}
+	items := []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT"}`),
+	}
+	if !state.emitCarriedReasoning(items) {
+		t.Fatal("emitCarriedReasoning failed")
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "signature_delta") {
+		t.Fatalf("no signature_delta frame; the client will drop the carrier:\n%s", body)
+	}
+	if !strings.Contains(body, reasoningCarrierPrefix) {
+		t.Fatalf("carrier payload never reached the wire:\n%s", body)
+	}
+
+	// And it must be recoverable from the delta, byte-identically — Copilot
+	// decrypts what is inside.
+	var signature string
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var evt struct {
+			Delta *struct {
+				Type      string `json:"type"`
+				Signature string `json:"signature"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &evt) != nil {
+			continue
+		}
+		if evt.Delta != nil && evt.Delta.Type == "signature_delta" {
+			signature = evt.Delta.Signature
+		}
+	}
+	if signature == "" {
+		t.Fatal("signature_delta frame carried no signature")
+	}
+	decoded, ok := decodeReasoningCarrier(signature)
+	if !ok || len(decoded) != 1 || string(decoded[0]) != string(items[0]) {
+		t.Fatalf("carrier did not survive the stream: ok=%v decoded=%v", ok, decoded)
 	}
 }
