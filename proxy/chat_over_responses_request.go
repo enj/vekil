@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -24,6 +25,7 @@ func newChatInvalidRequest(param, message string) *chatExecutionError {
 
 type responsesChatRequestOptions struct {
 	UpstreamModel       string
+	CarriedReasoning    map[string]carriedReplay
 	ReplayStore         *responsesChatReplayStore
 	ReplayRoute         responsesChatReplayRoute
 	MinimumOutputTokens int
@@ -258,7 +260,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 	input := make([]json.RawMessage, 0, len(messages))
 	calls := make(map[string]string)
 	results := make(map[string]struct{})
-	restoredGroups := make(map[uint64]struct{})
+	restoredGroups := make(map[string]struct{})
 	for index, raw := range messages {
 		messageParam := fmt.Sprintf("messages[%d]", index)
 		if _, err := validateChatRawObjectFields(raw, messageParam, "role", "content", "refusal", "name", "tool_calls", "tool_call_id"); err != nil {
@@ -364,21 +366,20 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				}
 				continue
 			}
-			if options.ReplayStore == nil {
-				return nil, missingResponsesChatReplayError()
-			}
-			projectionContent, _ := json.Marshal(assistantHistoryText(content))
-			resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
+			restored, err := restoreResponsesChatCalls(options, projected, content)
 			if err != nil {
-				return nil, mapResponsesChatReplayResolveError(err)
+				return nil, err
 			}
-			if _, duplicate := restoredGroups[resolution.GroupID]; duplicate {
+			if _, duplicate := restoredGroups[restored.Key]; duplicate {
 				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
 			}
-			restoredGroups[resolution.GroupID] = struct{}{}
-			resolvedByProxy := make(map[string]responsesChatReplayResolvedCall, len(resolution.Calls))
+			restoredGroups[restored.Key] = struct{}{}
+			if restored.Carried {
+				restored = reconstructCarriedRestore(restored, projected, assistantHistoryText(content))
+			}
+			resolvedByProxy := make(map[string]responsesChatReplayResolvedCall, len(restored.Calls))
 			matchedResults := 0
-			for _, call := range resolution.Calls {
+			for _, call := range restored.Calls {
 				resolvedByProxy[call.ProxyCallID] = call
 				if resultIndex, ok := resultIndices[call.ProxyCallID]; ok && resultIndex > index {
 					matchedResults++
@@ -387,8 +388,8 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			if matchedResults == 0 {
 				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "Responses-backed assistant tool calls require at least one subsequent tool result")
 			}
-			if matchedResults == len(resolution.Calls) {
-				input = append(input, cloneReplayRawMessages(resolution.OutputItems)...)
+			if matchedResults == len(restored.Calls) {
+				input = append(input, cloneReplayRawMessages(restored.OutputItems)...)
 			} else {
 				// Live gpt-5.6-sol rejects a complete parallel call group when only a
 				// subset has outputs. Replay the visible assistant text plus only the
@@ -442,6 +443,39 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 		}
 	}
 	return input, nil
+}
+
+type responsesChatRestoredCalls struct {
+	Key         string
+	OutputItems []json.RawMessage
+	Calls       []responsesChatReplayResolvedCall
+	Carried     bool
+}
+
+// The store is authoritative while it holds the group; the carrier answers once it has
+// forgotten, under weaker guards: arguments stay unbound (see carriedProjectionDigest).
+func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) (responsesChatRestoredCalls, error) {
+	projectionContent, err := json.Marshal(assistantHistoryText(content))
+	if err != nil {
+		return responsesChatRestoredCalls{}, replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
+	}
+	if options.ReplayStore != nil {
+		resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
+		if err == nil {
+			return responsesChatRestoredCalls{
+				Key:         "group:" + strconv.FormatUint(resolution.GroupID, 10),
+				OutputItems: resolution.OutputItems,
+				Calls:       resolution.Calls,
+			}, nil
+		}
+		if mapped := mapResponsesChatReplayResolveError(err); !isMissingResponsesChatReplayError(mapped) {
+			return responsesChatRestoredCalls{}, mapped
+		}
+	}
+	if restored, ok := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent); ok {
+		return restored, nil
+	}
+	return responsesChatRestoredCalls{}, missingResponsesChatReplayError()
 }
 
 func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {
@@ -535,6 +569,11 @@ func assistantHistoryText(content []map[string]any) string {
 func appendAssistantHistoryMessage(input []json.RawMessage, text string) []json.RawMessage {
 	item, _ := json.Marshal(map[string]any{"role": "assistant", "content": text})
 	return append(input, item)
+}
+
+func responsesFunctionCallItem(callID, name, arguments string) json.RawMessage {
+	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments})
+	return item
 }
 
 func isResponsesChatReplayCallID(id string) bool {
@@ -635,8 +674,9 @@ func translateSyntheticChatToolCall(raw json.RawMessage, messageIndex, callIndex
 		return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".type", "only function tool calls and replay-backed custom tool calls are supported")
 	}
 
-	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments})
-	return translatedSyntheticChatToolCall{ID: callID, Name: name, Arguments: arguments, Item: item}, nil
+	return translatedSyntheticChatToolCall{
+		ID: callID, Name: name, Arguments: arguments, Item: responsesFunctionCallItem(callID, name, arguments),
+	}, nil
 }
 
 func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error) {

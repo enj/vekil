@@ -415,7 +415,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	downstreamReplayPassthrough := false
 	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
 		var replayErr error
-		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody)
+		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody, input.CarriedReasoning)
 		if replayErr != nil {
 			baselineRoute := profile.routeForTier(profile.baselineTier)
 			downstreamReplayPassthrough = (mode == policyModeOff || mode == policyModeObserve) &&
@@ -489,7 +489,7 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 	return nil
 }
 
-func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte) (*modelRoute, policyTier, error) {
+func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) (*modelRoute, policyTier, error) {
 	if c == nil || c.h == nil || profile == nil {
 		return nil, policyTierUnknown, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model does not support Responses replay continuations")}
 	}
@@ -497,6 +497,7 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 		route *modelRoute
 		tier  policyTier
 	}
+	carried = routeSelectingCarriers(carried)
 	candidates := []candidate{{route: profile.lightweight, tier: policyTierLightweight}, {route: profile.powerful, tier: policyTierPowerful}}
 	responsesCapable := false
 	var missing error
@@ -514,8 +515,9 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 				upstreamModel = profile.entry.id
 			}
 			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
-				UpstreamModel: upstreamModel,
-				ReplayStore:   c.h.responsesChatReplayStore(),
+				UpstreamModel:    upstreamModel,
+				CarriedReasoning: carried,
+				ReplayStore:      c.h.responsesChatReplayStore(),
 				ReplayRoute: responsesChatReplayRoute{
 					ProviderID:    target.provider.id,
 					PublicModel:   profile.entry.id,
