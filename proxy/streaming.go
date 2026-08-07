@@ -2276,7 +2276,7 @@ func (s *anthropicStreamState) emitCarriedReasoning(turn carriedTurn) bool {
 	if !s.emit("content_block_start", models.AnthropicStreamEvent{
 		Type:         "content_block_start",
 		Index:        intVal(index),
-		ContentBlock: &models.ContentBlock{Type: "thinking"},
+		ContentBlock: &models.ContentBlock{Type: "thinking", Thinking: stringPtr("")},
 	}) {
 		return false
 	}

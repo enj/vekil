@@ -221,7 +221,7 @@ func reasoningCarrierBlock(turn carriedTurn) (*models.ContentBlock, error) {
 	if err != nil || signature == "" {
 		return nil, err
 	}
-	return &models.ContentBlock{Type: "thinking", Signature: signature}, nil
+	return &models.ContentBlock{Type: "thinking", Thinking: stringPtr(""), Signature: signature}, nil
 }
 
 // Keyed by tool_use id, not message index, because clients trim history. Every
