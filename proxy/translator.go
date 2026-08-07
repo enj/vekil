@@ -146,11 +146,34 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 		return nil, fmt.Errorf("system is neither string nor []ContentBlock: %w", err)
 	}
 
+	// Join blocks with a newline rather than concatenating them raw.
+	//
+	// Anthropic treats system content blocks as distinct units; Chat has a
+	// single system string, so flattening is unavoidable. Doing it without a
+	// separator silently corrupts the prompt whenever a block does not happen
+	// to end in a newline -- and Claude Code sends several blocks (that is
+	// what cache_control breakpoints sit between), so this is the normal case,
+	// not an edge one. Observed before the fix:
+	//
+	//     You are Claude Code, Anthropic's official CLI.# Tone
+	//     Be concise.# Memory
+	//
+	// The headings are welded onto the end of the previous sentence and stop
+	// being headings. A single "\n" is the conservative repair: it prevents
+	// blocks running together without inventing paragraph breaks that were not
+	// in the original.
 	var sb strings.Builder
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			sb.WriteString(derefString(b.Text))
+			text := derefString(b.Text)
+			if text == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(text)
 		default:
 			return nil, fmt.Errorf("unsupported system content block type %q", b.Type)
 		}

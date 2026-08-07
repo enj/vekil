@@ -843,3 +843,61 @@ func TestMapStopReason(t *testing.T) {
 		})
 	}
 }
+
+// A multi-block system prompt must not have its blocks welded together.
+//
+// Anthropic treats system blocks as distinct units and Claude Code sends
+// several of them -- cache_control breakpoints sit between them -- so this is
+// the normal shape, not an edge case. Concatenating raw produced:
+//
+//	You are Claude Code, Anthropic's official CLI.# Tone
+//	Be concise.# Memory
+//
+// where each heading is welded onto the previous sentence and stops being a
+// heading. Nothing errors; the model just receives a subtly mangled prompt.
+func TestParseSystemMessageJoinsBlocksWithoutWeldingThem(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"text","text":"You are Claude Code, Anthropic's official CLI."},
+		{"type":"text","text":"# Tone\nBe concise.","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"# Memory\nUser prefers pytest -x."}
+	]`)
+	msg, err := parseSystemMessage(raw)
+	if err != nil {
+		t.Fatalf("parseSystemMessage: %v", err)
+	}
+	var got string
+	if err := json.Unmarshal(msg.Content, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, welded := range []string{".# Tone", ".# Memory"} {
+		if strings.Contains(got, welded) {
+			t.Fatalf("blocks welded together at %q:\n%s", welded, got)
+		}
+	}
+	// Every heading must still start its own line.
+	for _, heading := range []string{"\n# Tone", "\n# Memory"} {
+		if !strings.Contains(got, heading) {
+			t.Fatalf("heading %q lost its line start:\n%s", heading, got)
+		}
+	}
+	// And no content may be dropped.
+	for _, frag := range []string{"official CLI.", "Be concise.", "pytest -x."} {
+		if !strings.Contains(got, frag) {
+			t.Fatalf("content %q missing:\n%s", frag, got)
+		}
+	}
+}
+
+// Empty blocks must not introduce blank lines.
+func TestParseSystemMessageSkipsEmptyBlocks(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"first"},{"type":"text","text":""},{"type":"text","text":"second"}]`)
+	msg, err := parseSystemMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	_ = json.Unmarshal(msg.Content, &got)
+	if got != "first\nsecond" {
+		t.Fatalf("got %q, want %q", got, "first\nsecond")
+	}
+}
