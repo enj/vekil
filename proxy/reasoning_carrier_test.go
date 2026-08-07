@@ -127,8 +127,8 @@ func TestReasoningCarrierBlockShape(t *testing.T) {
 		t.Fatalf("type = %v, want thinking", block.Type)
 	}
 	// Empty thinking text is deliberate: the carrier shows the user nothing new.
-	if block.Thinking != "" {
-		t.Fatalf("thinking = %q, want empty", block.Thinking)
+	if block.Thinking == nil || *block.Thinking != "" {
+		t.Fatalf("thinking = %v, want a present empty string", block.Thinking)
 	}
 	if !strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
 		t.Fatalf("signature not version-tagged: %q", block.Signature)
@@ -314,5 +314,50 @@ func TestCarrierRouteDigestRejectsAnotherRoute(t *testing.T) {
 	}
 	if _, ok := carriedRestoredCalls(carried, projected, other, content); ok {
 		t.Fatal("a different route restored the carrier, so nothing binds it to its model or tier")
+	}
+}
+
+// Assert on the MARSHALLED BYTES. A struct round-trip cannot see a field that
+// omitempty deleted on the way out, which is how {"type":"thinking",
+// "signature":...} shipped and killed clients on i.thinking.length.
+func TestCarrierBlockKeepsThinkingOnTheWire(t *testing.T) {
+	block, err := reasoningCarrierBlock(carriedTurn{Items: sampleReasoningItems()})
+	if err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	encoded, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	raw, present := wire["thinking"]
+	if !present {
+		t.Fatalf("no thinking key on the wire; clients dereference it:\n%s", encoded)
+	}
+	var thinking string
+	if json.Unmarshal(raw, &thinking) != nil || thinking != "" {
+		t.Fatalf("thinking = %s, want an empty string", raw)
+	}
+}
+
+// Non-carrier blocks must NOT gain the field: Anthropic does not send
+// `thinking` on a text block, which is why this is a pointer rather than
+// dropping omitempty.
+func TestNonCarrierBlocksOmitThinkingOnTheWire(t *testing.T) {
+	text := "hello"
+	for _, block := range []models.ContentBlock{
+		{Type: "text", Text: &text},
+		{Type: "tool_use", ID: "toolu_1", Name: "lookup", Input: json.RawMessage(`{}`)},
+	} {
+		encoded, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), `"thinking"`) {
+			t.Fatalf("%s block gained a thinking field: %s", block.Type, encoded)
+		}
 	}
 }
