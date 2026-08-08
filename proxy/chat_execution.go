@@ -190,6 +190,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		CarriedReasoning:    options.CarriedReasoning,
 		ReplayStore:         h.responsesChatReplayStore(),
 		ReplayRoute:         replayRoute,
+		Log:                 h.log,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
 	})

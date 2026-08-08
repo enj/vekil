@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/sozercan/vekil/logger"
 )
 
 func newChatInvalidRequest(param, message string) *chatExecutionError {
@@ -28,6 +30,7 @@ type responsesChatRequestOptions struct {
 	CarriedReasoning    map[string]carriedReplay
 	ReplayStore         *responsesChatReplayStore
 	ReplayRoute         responsesChatReplayRoute
+	Log                 *logger.Logger
 	MinimumOutputTokens int
 	DropSamplingParams  bool
 }
@@ -340,35 +343,24 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
 			}
 			if replayCalls == 0 {
-				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
-					input = appendAssistantHistoryMessage(input, assistantText)
-				}
-				matchedResults := 0
-				for _, projectedCall := range projected {
-					if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
-						matchedResults++
-					}
-				}
-				if matchedResults == 0 {
-					return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
-				}
-				for callIndex, projectedCall := range projected {
-					if matchedResults < len(projected) {
-						if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
-							continue
-						}
-					}
-					if _, duplicate := calls[projectedCall.ID]; duplicate {
-						return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls[%d].id", index, callIndex), "duplicate tool call ID")
-					}
-					calls[projectedCall.ID] = projectedCall.ID
-					input = append(input, syntheticItems[callIndex])
+				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
+				if err != nil {
+					return nil, err
 				}
 				continue
 			}
 			restored, err := restoreResponsesChatCalls(options, projected, content)
 			if err != nil {
-				return nil, err
+				// Erroring here wedged the conversation: a client cannot repair a transcript it already sent.
+				if !isResponsesChatReplayProjectionError(err) {
+					return nil, err
+				}
+				logResponsesChatReplayDegrade(options, len(projected))
+				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
+				if err != nil {
+					return nil, err
+				}
+				continue
 			}
 			if _, duplicate := restoredGroups[restored.Key]; duplicate {
 				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
@@ -476,6 +468,51 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 		return restored, nil
 	}
 	return responsesChatRestoredCalls{}, missingResponsesChatReplayError()
+}
+
+func appendVisibleAssistantTurn(input []json.RawMessage, calls map[string]string, resultIndices map[string]int, projected []responsesChatReplayProjectedCall, items []json.RawMessage, assistantText string, index int) ([]json.RawMessage, error) {
+	if assistantText != "" {
+		input = appendAssistantHistoryMessage(input, assistantText)
+	}
+	matchedResults := 0
+	for _, projectedCall := range projected {
+		if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
+			matchedResults++
+		}
+	}
+	if matchedResults == 0 {
+		return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
+	}
+	for callIndex, projectedCall := range projected {
+		if matchedResults < len(projected) {
+			if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
+				continue
+			}
+		}
+		if _, duplicate := calls[projectedCall.ID]; duplicate {
+			return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls[%d].id", index, callIndex), "duplicate tool call ID")
+		}
+		calls[projectedCall.ID] = projectedCall.ID
+		input = append(input, items[callIndex])
+	}
+	return input, nil
+}
+
+func isResponsesChatReplayProjectionError(err error) bool {
+	var executionErr *chatExecutionError
+	return errors.As(err, &executionErr) && executionErr.Code == responsesChatReplayProjectionCode
+}
+
+func logResponsesChatReplayDegrade(options responsesChatRequestOptions, toolCalls int) {
+	if options.Log == nil {
+		return
+	}
+	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity",
+		logger.F("provider", options.ReplayRoute.ProviderID),
+		logger.F("model", options.ReplayRoute.PublicModel),
+		logger.F("route_id", options.ReplayRoute.RouteID),
+		logger.F("tool_calls", toolCalls),
+	)
 }
 
 func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {

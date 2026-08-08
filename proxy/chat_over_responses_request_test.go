@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -706,9 +707,18 @@ func TestTranslateChatRequestToResponsesIgnoresContinuationOnlyDefaultsForReplay
 			}},
 		}}},
 	})
-	_, err = translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route})
-	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayProjectionCode {
-		t.Fatalf("error = %#v, want replay projection mismatch", err)
+	// A drifted projection degrades rather than wedging the conversation, so the
+	// guard that matters is what upstream is told: the stored call must not be
+	// reused to launder arguments the store never saw.
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	input := upstreamInputJSON(t, plan)
+	if strings.Contains(input, "upstream-edit") {
+		t.Fatalf("rewritten arguments reused the stored call: %s", input)
+	}
+	if !strings.Contains(input, callID) {
+		t.Fatalf("degraded turn dropped the visible call: %s", input)
 	}
 }

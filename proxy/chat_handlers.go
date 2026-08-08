@@ -1158,6 +1158,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 			CarriedReasoning:    options.CarriedReasoning,
 			ReplayStore:         h.responsesChatReplayStore(),
 			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
+			Log:                 h.log,
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
 		})

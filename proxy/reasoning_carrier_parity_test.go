@@ -233,9 +233,9 @@ func TestCarriedParallelResultsBindByIDNotPosition(t *testing.T) {
 	}
 }
 
-// The store validates the assistant projection, so the carrier must too: otherwise a
-// drifted transcript 400s while the store is live and is silently accepted once it
-// has forgotten -- the same input, two answers, decided by server state.
+// The store validates the assistant projection, so the carrier must too: neither may
+// hand a drifted transcript the reasoning that was minted for a different one. Drift
+// no longer 400s -- it degrades -- so the invariant is what upstream is told.
 func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 	cases := map[string]func(*testing.T, responsesChatReplayPublished) []byte{
 		"reordered tool-call group": func(t *testing.T, published responsesChatReplayPublished) []byte {
@@ -256,16 +256,18 @@ func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 			body := build(t, published)
 			carried := carriedForEveryCall(t, route, published, items)
 
-			if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+			if plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
 				UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
-			}); err == nil {
-				t.Fatal("the store accepted this projection, so there is nothing for the carrier to agree with")
+			}); err != nil {
+				t.Fatalf("a live store must degrade a drifted projection, not reject it: %v", err)
+			} else if input := upstreamInputJSON(t, plan); strings.Contains(input, "OPAQUE") || strings.Contains(input, "upstream-call-") {
+				t.Fatalf("the store replayed its state for a projection it does not match: %s", input)
 			}
 			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
 				UpstreamModel: "gpt-upstream", ReplayRoute: route, CarriedReasoning: carried,
 			})
 			if err == nil {
-				t.Fatal("carrier accepted a projection the store rejects")
+				t.Fatal("carrier accepted a projection the store does not match")
 			}
 			if !isMissingResponsesChatReplayError(err) {
 				t.Fatalf("err = %v, want the missing-replay degrade", err)
@@ -312,7 +314,8 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	}
 }
 
-// While the store holds the group it is authoritative, arguments included.
+// While the store holds the group it is authoritative, arguments included: rewritten
+// arguments degrade to a turn built from the transcript, never to the stored one.
 func TestCarrierDoesNotBypassALiveStoresProjectionCheck(t *testing.T) {
 	store, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
 	body := carrierParityBody(t, published, inOrder(1), inOrder(1))
@@ -321,11 +324,15 @@ func TestCarrierDoesNotBypassALiveStoresProjectionCheck(t *testing.T) {
 		t.Fatal("fixture no longer carries the arguments this test rewrites")
 	}
 
-	if _, err := translateChatRequestToResponses([]byte(tampered), responsesChatRequestOptions{
+	plan, err := translateChatRequestToResponses([]byte(tampered), responsesChatRequestOptions{
 		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
 		CarriedReasoning: carriedForEveryCall(t, route, published, items),
-	}); err == nil {
-		t.Fatal("a carrier let rewritten arguments past the live store")
+	})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if input := upstreamInputJSON(t, plan); strings.Contains(input, "OPAQUE") || strings.Contains(input, "upstream-call-1") {
+		t.Fatalf("rewritten arguments were paired with stored state: %s", input)
 	}
 }
 
