@@ -234,8 +234,8 @@ func TestCarriedParallelResultsBindByIDNotPosition(t *testing.T) {
 }
 
 // The store validates the assistant projection, so the carrier must too: neither may
-// hand a drifted transcript the reasoning that was minted for a different one. Drift
-// no longer 400s -- it degrades -- so the invariant is what upstream is told.
+// hand a drifted transcript the reasoning that was minted for a different one. Against a
+// live store that degrades; without one it still fails closed.
 func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 	cases := map[string]func(*testing.T, responsesChatReplayPublished) []byte{
 		"reordered tool-call group": func(t *testing.T, published responsesChatReplayPublished) []byte {
@@ -270,7 +270,7 @@ func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 				t.Fatal("carrier accepted a projection the store does not match")
 			}
 			if !isMissingResponsesChatReplayError(err) {
-				t.Fatalf("err = %v, want the missing-replay degrade", err)
+				t.Fatalf("err = %v, want the missing-replay rejection", err)
 			}
 		})
 	}

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,10 +50,8 @@ func degradeFixture(t *testing.T, store *responsesChatReplayStore, route respons
 	return matching, drifted, callID
 }
 
-// TestProjectionMismatchDegradesToTheVisibleTranscript is the wedge this change
-// removes: a drifted projection used to 400 forever, because the client cannot
-// repair a transcript it has already sent. The turn must now reach upstream built
-// from the visible messages, and carry no reasoning.
+// A drifted projection must reach upstream rebuilt from the visible messages,
+// carrying no reasoning.
 func TestProjectionMismatchDegradesToTheVisibleTranscript(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -166,13 +165,11 @@ func TestProjectionMismatchDegradeIsLogged(t *testing.T) {
 	}
 }
 
-// TestHandleOpenAIChatCompletionsProjectionMismatchReachesUpstream drives the whole
-// ingress: the client must get an answer, not the 400 that ended the conversation.
+// Through the whole ingress: the client gets an answer, not a 400.
 func TestHandleOpenAIChatCompletionsProjectionMismatchReachesUpstream(t *testing.T) {
 	var upstreamBodies [][]byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := make([]byte, r.ContentLength)
-		_, _ = r.Body.Read(body)
+		body, _ := io.ReadAll(r.Body)
 		upstreamBodies = append(upstreamBodies, body)
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	}))

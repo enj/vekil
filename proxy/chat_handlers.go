@@ -1151,14 +1151,14 @@ func isMissingResponsesChatReplayError(err error) bool {
 	return errors.As(err, &executionErr) && executionErr.Code == responsesChatReplayMissingCode
 }
 
-func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions) (responsesChatRequestPlan, targetBinding, error) {
+func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions, log *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
 	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:       route.public.id,
 			CarriedReasoning:    options.CarriedReasoning,
 			ReplayStore:         h.responsesChatReplayStore(),
 			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
-			Log:                 h.log,
+			Log:                 log,
 			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:  options.ResponsesDropSamplingParams,
 		})
@@ -1208,7 +1208,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 
 func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *modelRoute, chatBody []byte, requestedModel string, options chatExecutionOptions) (chatExecutionResult, error) {
 	operation := routeOperationFromContext(ctx)
-	plan, plannedTarget, err := h.prepareExplicitResponsesChatRequest(operation, route, chatBody, options)
+	plan, plannedTarget, err := h.prepareExplicitResponsesChatRequest(operation, route, chatBody, options, h.log)
 	if err != nil {
 		attachExplicitChatExecutionErrorRoute(err, route, plannedTarget, providerEndpointResponses, chatBackendResponses)
 		return chatExecutionResult{}, err

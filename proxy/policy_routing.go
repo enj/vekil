@@ -482,7 +482,8 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) || !explicitRouteHasChatBackend(route, providerEndpointResponses) {
 			continue
 		}
-		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}); err != nil {
+		// nil logger: a validation preflight re-translates, so its degrade is logged by the real pass.
+		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}, nil); err != nil {
 			return err
 		}
 	}

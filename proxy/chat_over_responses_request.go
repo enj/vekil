@@ -461,6 +461,9 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 			}, nil
 		}
 		if mapped := mapResponsesChatReplayResolveError(err); !isMissingResponsesChatReplayError(mapped) {
+			if errors.Is(err, &responsesChatReplayProjectionError{}) {
+				return responsesChatRestoredCalls{}, &responsesChatDegradableError{mapped}
+			}
 			return responsesChatRestoredCalls{}, mapped
 		}
 	}
@@ -498,9 +501,14 @@ func appendVisibleAssistantTurn(input []json.RawMessage, calls map[string]string
 	return input, nil
 }
 
+// Only a store-reported mismatch degrades; the mapper reuses this code as its catch-all.
+type responsesChatDegradableError struct{ error }
+
+func (e *responsesChatDegradableError) Unwrap() error { return e.error }
+
 func isResponsesChatReplayProjectionError(err error) bool {
-	var executionErr *chatExecutionError
-	return errors.As(err, &executionErr) && executionErr.Code == responsesChatReplayProjectionCode
+	var degradable *responsesChatDegradableError
+	return errors.As(err, &degradable)
 }
 
 func logResponsesChatReplayDegrade(options responsesChatRequestOptions, toolCalls int) {
