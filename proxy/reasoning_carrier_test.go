@@ -194,7 +194,7 @@ func TestExtractCarriedReasoningKeysEveryToolUseInTheTurn(t *testing.T) {
 	msgs := []models.AnthropicMessage{
 		assistantWithCarrier(t, []string{"call_a", "call_b"}, items),
 	}
-	carried := extractCarriedReasoning(msgs)
+	carried, _ := extractCarriedReasoning(msgs)
 	if len(carried) != 2 {
 		t.Fatalf("carried %d ids, want 2", len(carried))
 	}
@@ -213,7 +213,7 @@ func TestExtractCarriedReasoningIsPerTurn(t *testing.T) {
 		assistantWithCarrier(t, []string{"call_1"}, first),
 		assistantWithCarrier(t, []string{"call_2"}, second),
 	}
-	carried := extractCarriedReasoning(msgs)
+	carried, _ := extractCarriedReasoning(msgs)
 	if string(carried["call_1"].Items[0]) != string(first[0]) {
 		t.Fatalf("call_1 got the wrong turn: %s", carried["call_1"].Items[0])
 	}
@@ -242,7 +242,7 @@ func TestExtractCarriedReasoningToleratesTranscriptsWithoutCarriers(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if carried := extractCarriedReasoning(tc.msgs); carried != nil {
+			if carried, _ := extractCarriedReasoning(tc.msgs); carried != nil {
 				t.Fatalf("expected no carrier, got %v", carried)
 			}
 		})
@@ -271,7 +271,7 @@ func TestExtractCarriedReasoningIgnoresCarrierWithoutToolUse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	carried := extractCarriedReasoning([]models.AnthropicMessage{
+	carried, _ := extractCarriedReasoning([]models.AnthropicMessage{
 		{Role: "assistant", Content: turn},
 		{Role: "assistant", Content: bare},
 	})
@@ -309,10 +309,10 @@ func TestCarrierRouteDigestRejectsAnotherRoute(t *testing.T) {
 	}
 	carried := map[string]carriedReplay{"call_vekil_x": replay}
 
-	if _, ok := carriedRestoredCalls(carried, projected, minted, content); !ok {
+	if _, reason := carriedRestoredCalls(carried, projected, minted, content); reason != "" {
 		t.Fatal("the minting route did not restore its own carrier")
 	}
-	if _, ok := carriedRestoredCalls(carried, projected, other, content); ok {
+	if _, reason := carriedRestoredCalls(carried, projected, other, content); reason == "" {
 		t.Fatal("a different route restored the carrier, so nothing binds it to its model or tier")
 	}
 }
@@ -359,5 +359,51 @@ func TestNonCarrierBlocksOmitThinkingOnTheWire(t *testing.T) {
 		if strings.Contains(string(encoded), `"thinking"`) {
 			t.Fatalf("%s block gained a thinking field: %s", block.Type, encoded)
 		}
+	}
+}
+
+// The budget is spent oldest-first, so a long transcript silently drops its NEWEST
+// carriers -- the turns whose store group is most likely still live, and so the ones
+// that reach the carrier only because a client rewrote their arguments.
+func TestCarrierBudgetStarvesNewestTurnsAndSaysSo(t *testing.T) {
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
+	message := func(index int) models.AnthropicMessage {
+		id := "call_vekil_budget" + string(rune('a'+index))
+		items := []json.RawMessage{json.RawMessage(`{"type":"function_call","call_id":"upstream-1","name":"lookup","arguments":"{}","pad":"` +
+			strings.Repeat("A", 900_000) + `"}`)}
+		signature, err := encodeReasoningCarrier(carriedTurn{
+			Items: items, Route: route,
+			Calls: []carriedCall{{ProxyID: id, UpstreamID: "upstream-1", Name: "lookup"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks, err := json.Marshal([]models.ContentBlock{
+			{Type: "thinking", Thinking: stringPtr(""), Signature: signature},
+			{Type: "tool_use", ID: id, Name: "lookup", Input: json.RawMessage(`{}`)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return models.AnthropicMessage{Role: "assistant", Content: blocks}
+	}
+	var messages []models.AnthropicMessage
+	for i := 0; i < 12; i++ {
+		messages = append(messages, message(i))
+	}
+
+	carried, starved := extractCarriedReasoning(messages[:2])
+	if starved || len(carried) != 2 {
+		t.Fatalf("a short transcript must fit: starved = %v, carriers = %d", starved, len(carried))
+	}
+	carried, starved = extractCarriedReasoning(messages)
+	if !starved {
+		t.Fatal("crossing the budget must be reported, not silent")
+	}
+	if _, ok := carried["call_vekil_budgeta"]; !ok {
+		t.Fatal("the oldest turn was charged first, so it must have survived")
+	}
+	if _, ok := carried["call_vekil_budgetl"]; ok {
+		t.Fatal("the newest turn cannot have been decoded past an exhausted budget")
 	}
 }

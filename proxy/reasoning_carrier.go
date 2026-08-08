@@ -22,6 +22,7 @@ const reasoningCarrierPrefix = "vekil1."
 const (
 	reasoningCarrierMaxDecodedBytes = 1 << 20
 	reasoningCarrierRequestBudget   = 8 << 20
+	carriedDigestBytes              = 16
 )
 
 // Carried, not inferred from item order: positional binding misattaches the
@@ -121,7 +122,18 @@ func carriedProjectionDigest(content []byte, calls []responsesChatReplayProjecte
 		sum.Write([]byte{0})
 		sum.Write([]byte(call.Name))
 	}
-	return hex.EncodeToString(sum.Sum(nil)[:16])
+	return hex.EncodeToString(sum.Sum(nil)[:carriedDigestBytes])
+}
+
+// A digest is client input that keys a request-scoped map, so drop anything not ours.
+func carriedDigest(value string) string {
+	if len(value) != hex.EncodedLen(carriedDigestBytes) {
+		return ""
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return ""
+	}
+	return value
 }
 
 func carriedTurnFromPublished(route responsesChatReplayRoute, outputItems []json.RawMessage, published responsesChatReplayPublished) carriedTurn {
@@ -207,7 +219,7 @@ func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool)
 		Calls:            make(map[string]carriedCall, len(decoded.Calls)),
 		RouteDigest:      decoded.RouteDigest,
 		RouteTagValid:    reasoningCarrierRouteTagValid(decoded.RouteDigest, decoded.RouteTag),
-		ProjectionDigest: decoded.ProjectionDigest,
+		ProjectionDigest: carriedDigest(decoded.ProjectionDigest),
 	}
 	for _, call := range decoded.Calls {
 		replay.Calls[call.ProxyID] = call
@@ -226,8 +238,9 @@ func reasoningCarrierBlock(turn carriedTurn) (*models.ContentBlock, error) {
 
 // Keyed by tool_use id, not message index, because clients trim history. Every
 // tool_use in a message maps to that message's carrier: one output array per turn.
-func extractCarriedReasoning(messages []models.AnthropicMessage) map[string]carriedReplay {
-	carried := make(map[string]carriedReplay)
+// The budget is charged oldest-first, so a long transcript starves its newest turns.
+func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[string]carriedReplay, starved bool) {
+	carried = make(map[string]carriedReplay)
 	budget := reasoningCarrierRequestBudget
 	for _, msg := range messages {
 		if msg.Role != "assistant" {
@@ -248,6 +261,10 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) map[string]carr
 					continue
 				}
 				decodeSpent = true
+				if budget <= 0 {
+					starved = true
+					continue
+				}
 				if decoded, ok := decodeReasoningCarrier(block.Signature, &budget); ok {
 					replay = decoded
 				}
@@ -265,9 +282,9 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) map[string]carr
 		}
 	}
 	if len(carried) == 0 {
-		return nil
+		return nil, starved
 	}
-	return carried
+	return carried, starved
 }
 
 // A mixed group hands Copilot a chain that does not match the calls beside it.
@@ -329,17 +346,22 @@ func carriedItemsWellShaped(items []json.RawMessage) bool {
 }
 
 // The store's binding without the store: route, projection and each call's own minted id
-// must match, and indices mirror Publish -- one item each, in order, or state-missing.
-func carriedRestoredCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall, route responsesChatReplayRoute, projectionContent json.RawMessage) (responsesChatRestoredCalls, bool) {
+// must match, and indices mirror Publish. "" means restored, else the guard that refused.
+func carriedRestoredCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall, route responsesChatReplayRoute, projectionContent json.RawMessage) (responsesChatRestoredCalls, string) {
 	canonicalContent, err := canonicalReplayJSONValue(projectionContent)
 	if err != nil {
-		return responsesChatRestoredCalls{}, false
+		return responsesChatRestoredCalls{}, "projection"
 	}
 	replay, ok := carriedReplayForCalls(carried, projected)
-	if !ok || replay.RouteDigest != carriedRouteDigest(route) ||
-		replay.ProjectionDigest != carriedProjectionDigest(canonicalContent, projected) ||
-		!carriedItemsWellShaped(replay.Items) {
-		return responsesChatRestoredCalls{}, false
+	switch {
+	case !ok:
+		return responsesChatRestoredCalls{}, "absent"
+	case replay.RouteDigest != carriedRouteDigest(route):
+		return responsesChatRestoredCalls{}, "route"
+	case replay.ProjectionDigest != carriedProjectionDigest(canonicalContent, projected):
+		return responsesChatRestoredCalls{}, "projection"
+	case !carriedItemsWellShaped(replay.Items):
+		return responsesChatRestoredCalls{}, "shape"
 	}
 	calls := make([]responsesChatReplayResolvedCall, len(projected))
 	lastItemIndex := -1
@@ -348,11 +370,11 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 		upstreamID := strings.TrimSpace(call.UpstreamID)
 		if !known || upstreamID == "" || call.Name != strings.TrimSpace(projectedCall.Name) ||
 			call.ItemIndex <= lastItemIndex || call.ItemIndex >= len(replay.Items) {
-			return responsesChatRestoredCalls{}, false
+			return responsesChatRestoredCalls{}, "binding"
 		}
 		itemType, itemCallID := carriedItemHeader(replay.Items[call.ItemIndex])
 		if itemType != "function_call" || itemCallID != upstreamID {
-			return responsesChatRestoredCalls{}, false
+			return responsesChatRestoredCalls{}, "binding"
 		}
 		lastItemIndex = call.ItemIndex
 		calls[i] = responsesChatReplayResolvedCall{
@@ -372,7 +394,7 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 		OutputItems: replay.Items,
 		Calls:       calls,
 		Carried:     true,
-	}, true
+	}, ""
 }
 
 func carriedItemHeader(item json.RawMessage) (itemType, callID string) {

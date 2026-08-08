@@ -68,7 +68,7 @@ func TestCarrierRejectsItemShapesTheStoreWouldNotPublish(t *testing.T) {
 				RouteDigest:      carriedRouteDigest(route),
 				ProjectionDigest: carriedProjectionDigest(content, projected),
 			}}
-			if _, ok := carriedRestoredCalls(carried, projected, route, content); ok {
+			if _, reason := carriedRestoredCalls(carried, projected, route, content); reason == "" {
 				t.Fatal("carrier accepted an item shape the store never publishes")
 			}
 		})
@@ -119,7 +119,7 @@ func TestCarrierRejectsItemIndexesTheStoreWouldNotPublish(t *testing.T) {
 				ProjectionDigest: carriedProjectionDigest(content, projected),
 			}}
 			carried["call_vekil_y"] = carried["call_vekil_x"]
-			if _, ok := carriedRestoredCalls(carried, projected, route, content); ok {
+			if _, reason := carriedRestoredCalls(carried, projected, route, content); reason == "" {
 				t.Fatal("carrier accepted an item index the store never publishes")
 			}
 		})
@@ -158,10 +158,19 @@ func rewrittenCarrierItems(items []json.RawMessage, index int, item string) []js
 	return rewritten
 }
 
-func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, published responsesChatReplayPublished, items []json.RawMessage, results []int) string {
+func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, published responsesChatReplayPublished, items []json.RawMessage, results []int, store *responsesChatReplayStore) string {
 	t.Helper()
-	plan, err := translateChatRequestToResponses(carrierParityBody(t, published, inOrder(2), results), responsesChatRequestOptions{
-		UpstreamModel: "gpt-upstream", ReplayRoute: route,
+	body := carrierParityBody(t, published, inOrder(2), results)
+	if store != nil {
+		// Drift one argument so the store rejects and the carrier answers instead.
+		drifted := strings.Replace(string(body), `"arguments":"{\"q\":\"a\"}"`, `"arguments":"{\"q\":\"a\",\"replace_all\":false}"`, 1)
+		if drifted == string(body) {
+			t.Fatal("fixture no longer carries the arguments this drift rewrites")
+		}
+		body = []byte(drifted)
+	}
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream", ReplayRoute: route, ReplayStore: store,
 		CarriedReasoning: carriedForEveryCall(t, route, published, items),
 	})
 	if err != nil {
@@ -196,19 +205,26 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 		},
 	}
 	// Answering every call splices the whole turn; answering one takes the subset branch.
+	// Both store states reach carriedRestoredCalls: absent, and holding a group whose
+	// arguments the client rewrote, which is the live case this branch was added for.
 	for _, results := range [][]int{inOrder(2), {0}} {
-		for name, tamper := range cases {
-			t.Run(fmt.Sprintf("%s/%d results", name, len(results)), func(t *testing.T) {
-				_, route, items, published := publishInterleavedCarrierTurn(t)
-				input := carriedUpstreamInput(t, route, published, tamper(items), results)
-				if strings.Contains(input, "SMUGGLED") {
-					t.Fatalf("a carried item put unclassified content upstream: %s", input)
-				}
-				if !strings.Contains(input, `{"content":"checking","role":"assistant"}`) ||
-					!strings.Contains(input, `"arguments":"{\"q\":\"a\"}"`) {
-					t.Fatalf("the transcript's own assistant turn is missing: %s", input)
-				}
-			})
+		for _, withStore := range []bool{false, true} {
+			for name, tamper := range cases {
+				t.Run(fmt.Sprintf("%s/%d results/store %v", name, len(results), withStore), func(t *testing.T) {
+					store, route, items, published := publishInterleavedCarrierTurn(t)
+					if !withStore {
+						store = nil
+					}
+					input := carriedUpstreamInput(t, route, published, tamper(items), results, store)
+					if strings.Contains(input, "SMUGGLED") {
+						t.Fatalf("a carried item put unclassified content upstream: %s", input)
+					}
+					if !strings.Contains(input, `{"content":"checking","role":"assistant"}`) ||
+						!strings.Contains(input, `\"q\":\"a\"`) {
+						t.Fatalf("the transcript's own assistant turn is missing: %s", input)
+					}
+				})
+			}
 		}
 	}
 }
@@ -217,7 +233,7 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 func TestCarriedReasoningCiphertextReplaysAroundRebuiltCalls(t *testing.T) {
 	_, route, items, published := publishInterleavedCarrierTurn(t)
 	var input []json.RawMessage
-	if err := json.Unmarshal([]byte(carriedUpstreamInput(t, route, published, items, inOrder(2))), &input); err != nil {
+	if err := json.Unmarshal([]byte(carriedUpstreamInput(t, route, published, items, inOrder(2), nil)), &input); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
@@ -241,7 +257,7 @@ func TestCarriedReasoningCiphertextReplaysAroundRebuiltCalls(t *testing.T) {
 func TestCarriedTurnReplaysTranscriptTextWithoutItsMessageItem(t *testing.T) {
 	_, route, items, published := publishInterleavedCarrierTurn(t)
 	stripped := rewrittenCarrierItems(items, 1, `{"type":"reasoning","id":"rs_pad","encrypted_content":"PAD","content":[],"summary":[]}`)
-	input := carriedUpstreamInput(t, route, published, stripped, inOrder(2))
+	input := carriedUpstreamInput(t, route, published, stripped, inOrder(2), nil)
 	if !strings.Contains(input, `{"content":"checking","role":"assistant"}`) {
 		t.Fatalf("the transcript's assistant text left with the carrier's message item: %s", input)
 	}
@@ -296,7 +312,7 @@ func TestCarrierDecodeBudgetBoundsTheWholeRequest(t *testing.T) {
 		messages = append(messages, models.AnthropicMessage{Role: "assistant", Content: assistantBlocks(t,
 			map[string]any{"type": "thinking", "signature": signature}, toolUseBlock(mintedCallID(t)))})
 	}
-	carried := extractCarriedReasoning(messages)
+	carried, _ := extractCarriedReasoning(messages)
 
 	if len(carried) == 0 {
 		t.Fatal("budget rejected every carrier, so it is not bounding, it is disabling")
@@ -619,9 +635,9 @@ func TestCarrierRestoreKeyDistinguishesGroupsWithIdenticalItems(t *testing.T) {
 			RouteDigest:      carriedRouteDigest(route),
 			ProjectionDigest: carriedProjectionDigest(content, projected),
 		}}
-		restored, ok := carriedRestoredCalls(carried, projected, route, content)
-		if !ok {
-			t.Fatalf("carrier for %s did not restore", proxyID)
+		restored, reason := carriedRestoredCalls(carried, projected, route, content)
+		if reason != "" {
+			t.Fatalf("carrier for %s did not restore: %s", proxyID, reason)
 		}
 		return restored.Key
 	}

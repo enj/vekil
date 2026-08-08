@@ -355,7 +355,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				if !isResponsesChatReplayProjectionError(err) {
 					return nil, err
 				}
-				logResponsesChatReplayDegrade(options, projected, content)
+				logResponsesChatReplayDegrade(options, projected, content, err)
 				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
 				if err != nil {
 					return nil, err
@@ -445,14 +445,14 @@ type responsesChatRestoredCalls struct {
 }
 
 // The store is authoritative while it holds the group and its arguments still match.
-// Clients rewrite arguments; the carrier does not bind them (see carriedProjectionDigest)
-// and its items are the client's own ciphertext, so trying it grants no extra reach.
+// Clients rewrite arguments; the carrier does not bind them and holds only the client's
+// own ciphertext (see carriedProjectionDigest), so trying it grants no extra reach.
 func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) (responsesChatRestoredCalls, error) {
 	projectionContent, err := json.Marshal(assistantHistoryText(content))
 	if err != nil {
 		return responsesChatRestoredCalls{}, replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 	}
-	var degradable error
+	var degradable *responsesChatDegradableError
 	if options.ReplayStore != nil {
 		resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
 		if err == nil {
@@ -463,16 +463,19 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 			}, nil
 		}
 		if mapped := mapResponsesChatReplayResolveError(err); !isMissingResponsesChatReplayError(mapped) {
-			if !errors.Is(err, &responsesChatReplayProjectionError{}) {
+			var projection *responsesChatReplayProjectionError
+			if !errors.As(err, &projection) {
 				return responsesChatRestoredCalls{}, mapped
 			}
-			degradable = &responsesChatDegradableError{mapped}
+			degradable = &responsesChatDegradableError{error: mapped, diverged: projection.Reason}
 		}
 	}
-	if restored, ok := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent); ok {
+	restored, carrier := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent)
+	if carrier == "" {
 		return restored, nil
 	}
 	if degradable != nil {
+		degradable.carrier = carrier
 		return responsesChatRestoredCalls{}, degradable
 	}
 	return responsesChatRestoredCalls{}, missingResponsesChatReplayError()
@@ -507,7 +510,11 @@ func appendVisibleAssistantTurn(input []json.RawMessage, calls map[string]string
 }
 
 // Only a store-reported mismatch degrades; the mapper reuses this code as its catch-all.
-type responsesChatDegradableError struct{ error }
+type responsesChatDegradableError struct {
+	error
+	diverged string
+	carrier  string
+}
 
 func (e *responsesChatDegradableError) Unwrap() error { return e.error }
 
@@ -516,43 +523,47 @@ func isResponsesChatReplayProjectionError(err error) bool {
 	return errors.As(err, &degradable)
 }
 
-func logResponsesChatReplayDegrade(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) {
+func logCarriedReasoningStarved(log *logger.Logger, starved bool, model string) {
+	if log == nil || !starved {
+		return
+	}
+	log.Warn("reasoning carrier budget exhausted; newest turns lost reasoning continuity",
+		logger.F("model", model),
+		logger.F("budget_bytes", reasoningCarrierRequestBudget),
+	)
+}
+
+func logResponsesChatReplayDegrade(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any, err error) {
 	if options.Log == nil {
 		return
 	}
-	projection, carried, diverged := responsesChatReplayDegradeDigests(options, projected, content)
+	diverged, carrier := "unknown", "unknown"
+	var degradable *responsesChatDegradableError
+	if errors.As(err, &degradable) {
+		diverged, carrier = degradable.diverged, degradable.carrier
+	}
 	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity",
 		logger.F("provider", options.ReplayRoute.ProviderID),
 		logger.F("model", options.ReplayRoute.PublicModel),
 		logger.F("route_id", options.ReplayRoute.RouteID),
 		logger.F("tool_calls", len(projected)),
 		logger.F("diverged", diverged),
-		logger.F("projection", projection),
-		logger.F("carried_projection", carried),
+		logger.F("carrier", carrier),
+		logger.F("projection", responsesChatReplayProjectionFingerprint(projected, content)),
 	)
 }
 
-// Digests, never the projections: those are prompt data. A carrier digest that still
-// matches proves the text and the call sequence did not drift, leaving arguments --
-// the one thing the store binds and the carrier does not -- as what the store rejected.
-func responsesChatReplayDegradeDigests(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) (projection, carried, diverged string) {
+// Vekil's own digest, never the projection itself: that is prompt data.
+func responsesChatReplayProjectionFingerprint(projected []responsesChatReplayProjectedCall, content []map[string]any) string {
 	projectionContent, err := json.Marshal(assistantHistoryText(content))
 	if err != nil {
-		return "", "", "unknown"
+		return ""
 	}
 	canonical, err := canonicalReplayJSONValue(projectionContent)
 	if err != nil {
-		return "", "", "unknown"
+		return ""
 	}
-	projection = carriedProjectionDigest(canonical, projected)
-	replay, ok := carriedReplayForCalls(options.CarriedReasoning, projected)
-	if !ok {
-		return projection, "", "unknown"
-	}
-	if replay.ProjectionDigest == projection {
-		return projection, replay.ProjectionDigest, "arguments"
-	}
-	return projection, replay.ProjectionDigest, "content_or_calls"
+	return carriedProjectionDigest(canonical, projected)
 }
 
 func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {

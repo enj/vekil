@@ -50,8 +50,8 @@ func degradeFixture(t *testing.T, store *responsesChatReplayStore, route respons
 	return matching, drifted, callID
 }
 
-// A drifted projection must reach upstream rebuilt from the visible messages,
-// carrying no reasoning.
+// With no carrier to fall back on, a drifted projection reaches upstream rebuilt
+// from the visible messages, carrying no reasoning.
 func TestProjectionMismatchDegradesToTheVisibleTranscript(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })

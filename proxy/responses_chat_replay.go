@@ -477,12 +477,18 @@ func (s *responsesChatReplayStore) Resolve(route responsesChatReplayRoute, proje
 	}
 
 	match := responsesChatReplayProjectionMatch(0)
-	if group.matchesProjection(canonicalContent, projection.Calls, false) {
+	visible, reason := group.matchesProjection(canonicalContent, projection.Calls, false)
+	original := false
+	if !visible {
+		original, _ = group.matchesProjection(canonicalContent, projection.Calls, true)
+	}
+	switch {
+	case visible:
 		match = responsesChatReplayProjectionVisible
-	} else if group.matchesProjection(canonicalContent, projection.Calls, true) {
+	case original:
 		match = responsesChatReplayProjectionOriginal
-	} else {
-		return responsesChatReplayResolution{}, newResponsesChatReplayProjectionError("assistant projection mismatch")
+	default:
+		return responsesChatReplayResolution{}, newResponsesChatReplayProjectionError(reason)
 	}
 
 	if group.lruElement != nil {
@@ -751,18 +757,22 @@ func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
 	return r.ProviderID == other.ProviderID && r.PublicModel == other.PublicModel && r.UpstreamModel == other.UpstreamModel && r.RouteID == other.RouteID && r.PolicyTier == other.PolicyTier
 }
 
-func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) bool {
-	if !bytes.Equal(g.assistantContent, content) || len(g.calls) != len(projected) {
-		return false
+// Reports which side moved, so a degrade names it from the store, not from the client.
+func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) (bool, string) {
+	if !bytes.Equal(g.assistantContent, content) {
+		return false, "content"
+	}
+	if len(g.calls) != len(projected) {
+		return false, "calls"
 	}
 	for i, stored := range g.calls {
 		got := projected[i]
 		if stored.proxyCallID != got.ID || stored.name != got.Name {
-			return false
+			return false, "calls"
 		}
 		canonicalArguments, err := canonicalReplayArguments(got.Arguments)
 		if err != nil {
-			return false
+			return false, "arguments"
 		}
 		hash := sha256.Sum256(canonicalArguments)
 		matchesHash := func(want [sha256.Size]byte, defaults responsesChatReplayOptionalDefaults) bool {
@@ -774,13 +784,13 @@ func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected [
 		}
 		if original {
 			if !matchesHash(stored.originalHash, stored.originalOptionalDefaults) {
-				return false
+				return false, "arguments"
 			}
 		} else if !matchesHash(stored.visibleHash, stored.visibleOptionalDefaults) {
-			return false
+			return false, "arguments"
 		}
 	}
-	return true
+	return true, ""
 }
 
 func cloneResponsesChatReplayResolution(group *responsesChatReplayGroup, match responsesChatReplayProjectionMatch) responsesChatReplayResolution {

@@ -2019,7 +2019,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
-	carriedReasoning := extractCarriedReasoning(req.Messages)
+	carriedReasoning, starved := extractCarriedReasoning(req.Messages)
+	logCarriedReasoningStarved(h.log, starved, req.Model)
 	policyPlan, err := h.planOpenAIChatPolicyWithCarrier(r.Context(), req.Model, oaiBody, 0, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
@@ -2342,7 +2343,8 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	publicModel := req.Model
-	carriedReasoning := extractCarriedReasoning(req.Messages)
+	carriedReasoning, starved := extractCarriedReasoning(req.Messages)
+	logCarriedReasoningStarved(h.log, starved, req.Model)
 	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)

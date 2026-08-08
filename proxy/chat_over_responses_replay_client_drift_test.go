@@ -39,7 +39,7 @@ func clientDriftFixture(t *testing.T, store *responsesChatReplayStore, route res
 	if err != nil {
 		t.Fatal(err)
 	}
-	carried := extractCarriedReasoning([]models.AnthropicMessage{{Role: "assistant", Content: blocks}})
+	carried, _ := extractCarriedReasoning([]models.AnthropicMessage{{Role: "assistant", Content: blocks}})
 	if _, ok := carried[callID]; !ok {
 		t.Fatalf("fixture emitted no usable carrier for %s", callID)
 	}
@@ -121,65 +121,127 @@ func TestClientRewrittenArgumentsStillRestoreCarriedReasoning(t *testing.T) {
 			if !strings.Contains(input, `"encrypted_content":"OPAQUE"`) {
 				t.Fatalf("client argument drift threw away reasoning continuity: %s", input)
 			}
-			if !strings.Contains(input, `"call_id":"upstream-call-1"`) {
+			// The output item carries the same call_id, so read the binding off the call itself.
+			if got := restoredFunctionCall(t, input); got["call_id"] != "upstream-call-1" {
 				t.Fatalf("restored turn lost its upstream call binding: %s", input)
-			}
-			// The client's arguments are what upstream must see, not the stored ones.
-			if !strings.Contains(input, jsonStringOf(t, testCase.returned)) {
-				t.Fatalf("restored turn did not forward the client's arguments: %s", input)
+			} else if got["arguments"] != testCase.returned {
+				// The client's arguments are what upstream must see, not the stored ones.
+				t.Fatalf("restored call forwarded %q, want the client's %q", got["arguments"], testCase.returned)
 			}
 		})
 	}
 }
 
-func jsonStringOf(t *testing.T, value string) string {
+func restoredFunctionCall(t *testing.T, input string) map[string]any {
 	t.Helper()
-	encoded, err := json.Marshal(value)
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(input), &items); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item["type"] == "function_call" {
+			return item
+		}
+	}
+	t.Fatalf("no function_call item reached upstream: %s", input)
+	return nil
+}
+
+// A degrade must name both sides from evidence vekil owns: what the store rejected, and
+// which carrier guard then refused. Neither may be inferred from anything the client sent.
+func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
+	emitted := `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`
+	returned := `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`
+	for _, testCase := range []struct {
+		name        string
+		body        func(string) string
+		carrier     func(*testing.T, map[string]carriedReplay, responsesChatReplayRoute) map[string]carriedReplay
+		diverged    string
+		wantCarrier string
+		published   bool
+	}{{
+		name: "arguments rewritten, carrier minted elsewhere",
+		carrier: func(t *testing.T, c map[string]carriedReplay, r responsesChatReplayRoute) map[string]carriedReplay {
+			r.UpstreamModel = "gpt-other"
+			return reroutedCarrier(t, c, r)
+		},
+		diverged:    "arguments",
+		wantCarrier: "route",
+		published:   true,
+	}, {
+		name: "arguments rewritten, no carrier at all",
+		carrier: func(*testing.T, map[string]carriedReplay, responsesChatReplayRoute) map[string]carriedReplay {
+			return nil
+		},
+		diverged:    "arguments",
+		wantCarrier: "absent",
+		published:   true,
+	}, {
+		name:        "assistant text rewritten",
+		body:        func(b string) string { return strings.Replace(b, `"content":"checking"`, `"content":"CHANGED"`, 1) },
+		diverged:    "content",
+		wantCarrier: "projection",
+	}, {
+		name:        "call renamed",
+		body:        func(b string) string { return strings.Replace(b, `"name":"Edit"`, `"name":"Renamed"`, 1) },
+		diverged:    "calls",
+		wantCarrier: "projection",
+	}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+			carried, body, callID := clientDriftFixture(t, store, route, "Edit", emitted, returned)
+			requireStoreRejectsArguments(t, store, route, callID, "Edit", returned)
+			if testCase.body != nil {
+				mutated := testCase.body(string(body))
+				if mutated == string(body) {
+					t.Fatal("fixture no longer carries the text this case rewrites")
+				}
+				body = []byte(mutated)
+			}
+			if testCase.carrier != nil {
+				carried = testCase.carrier(t, carried, route)
+			}
+
+			var logs bytes.Buffer
+			if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+				UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
+				CarriedReasoning: carried,
+				Log:              logger.NewWithWriter(logger.LevelInfo, &logs),
+			}); err != nil {
+				t.Fatalf("translate: %v", err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+				t.Fatalf("unmarshal %q: %v", logs.String(), err)
+			}
+			if entry["diverged"] != testCase.diverged || entry["carrier"] != testCase.wantCarrier {
+				t.Fatalf("log = diverged %#v carrier %#v, want %q and %q in %#v",
+					entry["diverged"], entry["carrier"], testCase.diverged, testCase.wantCarrier, entry)
+			}
+			// Only an untouched projection reproduces the digest the turn was published under.
+			fingerprint, _ := entry["projection"].(string)
+			published := carriedProjectionDigest(canonicalDriftContent(t), []responsesChatReplayProjectedCall{{ID: callID, Name: "Edit", Arguments: returned}})
+			if fingerprint == "" || (fingerprint == published) != testCase.published {
+				t.Fatalf("projection hash %q matches published = %v, want %v in %#v", fingerprint, fingerprint == published, testCase.published, entry)
+			}
+			for _, leaked := range []string{"checking", "CHANGED", "Renamed", "old_string", "/tmp/a"} {
+				if strings.Contains(logs.String(), leaked) {
+					t.Fatalf("degrade log leaked prompt data %q: %s", leaked, logs.String())
+				}
+			}
+		})
+	}
+}
+
+func canonicalDriftContent(t *testing.T) []byte {
+	t.Helper()
+	canonical, err := canonicalReplayJSONValue(json.RawMessage(`"checking"`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(encoded)
-}
-
-// A degrade that survives the carrier must say which side of the projection moved, in
-// hashes: the projections themselves are prompt data and must never reach a log.
-func TestDegradeLogNamesTheDivergingSideInHashes(t *testing.T) {
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
-	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	emitted := `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`
-	returned := `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`
-	carried, body, callID := clientDriftFixture(t, store, route, "Edit", emitted, returned)
-	requireStoreRejectsArguments(t, store, route, callID, "Edit", returned)
-
-	// A carrier minted under a different route cannot restore, so the turn degrades even
-	// though its content and call sequence are provably unchanged.
-	var logs bytes.Buffer
-	elsewhere := route
-	elsewhere.UpstreamModel = "gpt-other"
-	if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
-		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
-		CarriedReasoning: reroutedCarrier(t, carried, elsewhere),
-		Log:              logger.NewWithWriter(logger.LevelInfo, &logs),
-	}); err != nil {
-		t.Fatalf("translate: %v", err)
-	}
-	var entry map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
-		t.Fatalf("unmarshal %q: %v", logs.String(), err)
-	}
-	if entry["diverged"] != "arguments" {
-		t.Fatalf("log[diverged] = %#v, want %q in %#v", entry["diverged"], "arguments", entry)
-	}
-	projection, _ := entry["projection"].(string)
-	if projection == "" || entry["carried_projection"] != projection {
-		t.Fatalf("matching projections must log as equal hashes: %#v", entry)
-	}
-	for _, leaked := range []string{"checking", "old_string", "/tmp/a"} {
-		if strings.Contains(logs.String(), leaked) {
-			t.Fatalf("degrade log leaked prompt data %q: %s", leaked, logs.String())
-		}
-	}
+	return canonical
 }
 
 func reroutedCarrier(t *testing.T, carried map[string]carriedReplay, route responsesChatReplayRoute) map[string]carriedReplay {
@@ -192,29 +254,24 @@ func reroutedCarrier(t *testing.T, carried map[string]carriedReplay, route respo
 	return rerouted
 }
 
-// Without a carrier there is nothing to narrow the mismatch with, and saying so beats
-// naming a side on no evidence.
-func TestDegradeLogSaysUnknownWithoutACarrier(t *testing.T) {
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
-	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	_, drifted, _ := degradeFixture(t, store, route)
-
-	var logs bytes.Buffer
-	if _, err := translateChatRequestToResponses(drifted, responsesChatRequestOptions{
-		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
-		Log: logger.NewWithWriter(logger.LevelInfo, &logs),
-	}); err != nil {
-		t.Fatalf("translate: %v", err)
-	}
-	var entry map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
-		t.Fatalf("unmarshal %q: %v", logs.String(), err)
-	}
-	if entry["diverged"] != "unknown" || entry["carried_projection"] != "" {
-		t.Fatalf("carrier-less degrade must report unknown: %#v", entry)
-	}
-	if projection, _ := entry["projection"].(string); projection == "" {
-		t.Fatalf("degrade must still log the recomputed projection hash: %#v", entry)
+// A digest is client input; one that is not ours must not travel into a restore key.
+func TestCarrierProjectionDigestMustLookLikeADigest(t *testing.T) {
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
+	items := []json.RawMessage{json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup","arguments":"{}"}`)}
+	for _, claimed := range []string{"not-a-hash", strings.Repeat("z", 32), strings.Repeat("ab", 4096)} {
+		signature, err := encodeReasoningCarrier(carriedTurn{
+			Items: items, Route: route, Projection: claimed,
+			Calls: []carriedCall{{ProxyID: "call_vekil_x", UpstreamID: "upstream-call-1", Name: "lookup"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replay, ok := decodeReasoningCarrier(signature, nil)
+		if !ok {
+			t.Fatalf("carrier claiming %q did not decode", claimed)
+		}
+		if replay.ProjectionDigest != "" {
+			t.Fatalf("decoded projection digest = %q, want it dropped", replay.ProjectionDigest)
+		}
 	}
 }

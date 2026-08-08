@@ -31,7 +31,7 @@ func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	carried := extractCarriedReasoning([]models.AnthropicMessage{
+	carried, _ := extractCarriedReasoning([]models.AnthropicMessage{
 		{Role: "assistant", Content: replayed},
 	})
 
@@ -72,7 +72,7 @@ func TestCarrierKeysOnTheMintedToolUseID(t *testing.T) {
 		Content: []models.ContentBlock{{Type: "tool_use", ID: mintedID}},
 	}, carriedTurn{Items: items})
 	replayed, _ := json.Marshal(resp.Content)
-	carried := extractCarriedReasoning([]models.AnthropicMessage{{Role: "assistant", Content: replayed}})
+	carried, _ := extractCarriedReasoning([]models.AnthropicMessage{{Role: "assistant", Content: replayed}})
 	if _, ok := carried[mintedID]; !ok {
 		t.Fatalf("minted call id did not key the carrier: %v", carried)
 	}
