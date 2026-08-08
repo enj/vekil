@@ -443,13 +443,20 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 // body: one 1490-turn session replayed 11.3 MB of it, the newest 100 turns 0.7 MB of that.
 const maxReasoningToolTurns = 100
 
+// Upstream caches on strict prefix: probed, 3 words changed near the front took cached
+// from 9012 to 0. Quantising holds the cutoff still per block; the window runs N..2N-1.
+func agedReasoningToolTurns(toolTurns int) int {
+	return max(toolTurns/maxReasoningToolTurns-1, 0) * maxReasoningToolTurns
+}
+
 // Only reasoning is droppable: dropping a function_call instead was measured against
 // Copilot as "No tool call found for function call output", so the mandatory floor stays.
 func trimAgedReasoning(input []json.RawMessage, toolTurnStarts []int, options responsesChatRequestOptions) []json.RawMessage {
-	if len(toolTurnStarts) <= maxReasoningToolTurns {
+	agedTurns := agedReasoningToolTurns(len(toolTurnStarts))
+	if agedTurns == 0 {
 		return input
 	}
-	aged := toolTurnStarts[len(toolTurnStarts)-maxReasoningToolTurns]
+	aged := toolTurnStarts[agedTurns]
 	kept := make([]json.RawMessage, 0, len(input))
 	items, itemBytes, retained := 0, 0, 0
 	for index, item := range input {
@@ -466,13 +473,13 @@ func trimAgedReasoning(input []json.RawMessage, toolTurnStarts []int, options re
 	if items == 0 {
 		return input
 	}
-	logTrimmedReasoning(options, len(toolTurnStarts), items, itemBytes, retained)
+	logTrimmedReasoning(options, len(toolTurnStarts), agedTurns, items, itemBytes, retained)
 	return kept
 }
 
-// Debug, not warn: past 100 tool turns this is the steady state and fires every turn,
+// Debug, not warn: past 200 tool turns this is the steady state and fires every turn,
 // where the warns beside it mark continuity vekil expected to keep and lost.
-func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, items, itemBytes, retained int) {
+func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, agedTurns, items, itemBytes, retained int) {
 	if options.Log == nil {
 		return
 	}
@@ -480,8 +487,8 @@ func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, items, 
 	options.Log.Debug("trimmed reasoning from tool turns older than the retained window",
 		logger.F("model", options.ReplayRoute.PublicModel),
 		logger.F("tool_turns", toolTurns),
-		logger.F("aged_turns", toolTurns-maxReasoningToolTurns),
-		logger.F("retained_turns", maxReasoningToolTurns),
+		logger.F("aged_turns", agedTurns),
+		logger.F("retained_turns", toolTurns-agedTurns),
 		logger.F("reasoning_items", items),
 		logger.F("reasoning_bytes", itemBytes),
 		logger.F("retained_reasoning_items", retained),
