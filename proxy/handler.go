@@ -839,8 +839,13 @@ func newInferenceTransport() *http.Transport {
 	}
 	transport.TLSClientConfig = tlsConfig
 
+	// 30s killed long reasoning turns. A reasoning model emits no frames while
+	// it thinks, so the keepalive probe fired mid-turn and tore the connection
+	// down: measured as a hard cliff past 34.5s, 533 successes under it and
+	// every failure between 34.7s and 48.5s, matching 30s idle plus a 0-15s
+	// ping wait. streamingUpstreamTimeout already allows 60 minutes.
 	if h2Transport, err := http2.ConfigureTransports(transport); err == nil {
-		h2Transport.ReadIdleTimeout = 30 * time.Second
+		h2Transport.ReadIdleTimeout = 300 * time.Second
 		h2Transport.PingTimeout = 15 * time.Second
 	}
 
