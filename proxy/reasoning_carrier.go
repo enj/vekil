@@ -25,8 +25,7 @@ const (
 	carriedDigestBytes              = 16
 )
 
-// Carried, not inferred from item order: positional binding misattaches the
-// results of same-name parallel calls.
+// Carried, not inferred from item order: positional binding misattaches same-name parallel calls.
 type carriedCall struct {
 	ProxyID    string `json:"proxy_id"`
 	UpstreamID string `json:"upstream_id"`
@@ -184,8 +183,7 @@ func encodeReasoningCarrier(turn carriedTurn) (string, error) {
 	return reasoningCarrierPrefix + base64.RawURLEncoding.EncodeToString(compressed.Bytes()), nil
 }
 
-// Unusable carriers return false rather than erroring: failing would turn lost
-// continuity into a dead conversation.
+// Unusable carriers return false, not error: failing turns lost continuity into a dead conversation.
 func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool) {
 	if !strings.HasPrefix(signature, reasoningCarrierPrefix) {
 		return carriedReplay{}, false

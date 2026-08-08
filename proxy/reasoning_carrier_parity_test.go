@@ -314,11 +314,9 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	}
 }
 
-// The store's argument binding is not a confidentiality boundary: the carrier has never
-// bound arguments (see carriedProjectionDigest), so any client can already pair rewritten
-// arguments with restored reasoning by waiting out the TTL, forcing eviction, or catching
-// a restart. What must hold either way is that a rewrite never yields state the client did
-// not already hold -- so the store here keeps a ciphertext the carrier does not carry.
+// Argument binding is not a confidentiality boundary: the carrier never bound arguments, so
+// a client can already pair rewritten arguments with restored reasoning by waiting out the
+// TTL. What must hold is that a rewrite yields no state the client did not already hold.
 func TestRewrittenArgumentsNeverReturnStateTheClientDidNotSupply(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
