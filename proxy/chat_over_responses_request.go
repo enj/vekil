@@ -444,13 +444,15 @@ type responsesChatRestoredCalls struct {
 	Carried     bool
 }
 
-// The store is authoritative while it holds the group; the carrier answers once it has
-// forgotten, under weaker guards: arguments stay unbound (see carriedProjectionDigest).
+// The store is authoritative while it holds the group and its arguments still match.
+// Clients rewrite arguments; the carrier does not bind them (see carriedProjectionDigest)
+// and its items are the client's own ciphertext, so trying it grants no extra reach.
 func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) (responsesChatRestoredCalls, error) {
 	projectionContent, err := json.Marshal(assistantHistoryText(content))
 	if err != nil {
 		return responsesChatRestoredCalls{}, replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 	}
+	var degradable error
 	if options.ReplayStore != nil {
 		resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
 		if err == nil {
@@ -461,14 +463,17 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 			}, nil
 		}
 		if mapped := mapResponsesChatReplayResolveError(err); !isMissingResponsesChatReplayError(mapped) {
-			if errors.Is(err, &responsesChatReplayProjectionError{}) {
-				return responsesChatRestoredCalls{}, &responsesChatDegradableError{mapped}
+			if !errors.Is(err, &responsesChatReplayProjectionError{}) {
+				return responsesChatRestoredCalls{}, mapped
 			}
-			return responsesChatRestoredCalls{}, mapped
+			degradable = &responsesChatDegradableError{mapped}
 		}
 	}
 	if restored, ok := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent); ok {
 		return restored, nil
+	}
+	if degradable != nil {
+		return responsesChatRestoredCalls{}, degradable
 	}
 	return responsesChatRestoredCalls{}, missingResponsesChatReplayError()
 }

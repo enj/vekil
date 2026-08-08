@@ -314,19 +314,55 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	}
 }
 
-// While the store holds the group it is authoritative, arguments included: rewritten
-// arguments degrade to a turn built from the transcript, never to the stored one.
-func TestCarrierDoesNotBypassALiveStoresProjectionCheck(t *testing.T) {
-	store, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
+// The store's argument binding is not a confidentiality boundary: the carrier has never
+// bound arguments (see carriedProjectionDigest), so any client can already pair rewritten
+// arguments with restored reasoning by waiting out the TTL, forcing eviction, or catching
+// a restart. What must hold either way is that a rewrite never yields state the client did
+// not already hold -- so the store here keeps a ciphertext the carrier does not carry.
+func TestRewrittenArgumentsNeverReturnStateTheClientDidNotSupply(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		withStore bool
+	}{{name: "store still holds the group", withStore: true},
+		{name: "store has forgotten the group", withStore: false}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
+			body := carrierParityBody(t, published, inOrder(1), inOrder(1))
+			tampered := strings.Replace(string(body), `"arguments":"{}"`, `"arguments":"{\"symbol\":\"ATTACKER\"}"`, 1)
+			if tampered == string(body) {
+				t.Fatal("fixture no longer carries the arguments this test rewrites")
+			}
+			options := responsesChatRequestOptions{
+				UpstreamModel: "gpt-upstream", ReplayRoute: route,
+				CarriedReasoning: carriedForEveryCall(t, route, published, reasoningCiphertext(items, "CLIENT_HELD")),
+			}
+			if testCase.withStore {
+				options.ReplayStore = store
+			}
+
+			plan, err := translateChatRequestToResponses([]byte(tampered), options)
+			if err != nil {
+				t.Fatalf("translate: %v", err)
+			}
+			input := upstreamInputJSON(t, plan)
+			if strings.Contains(input, "OPAQUE") {
+				t.Fatalf("a rewrite returned the store's own ciphertext: %s", input)
+			}
+			if !strings.Contains(input, "CLIENT_HELD") {
+				t.Fatalf("the client's own carrier was not restored: %s", input)
+			}
+		})
+	}
+}
+
+// Without a carrier there is nothing the client already holds, so a rewrite must degrade.
+func TestRewrittenArgumentsWithoutACarrierDegrade(t *testing.T) {
+	store, route, _, published := publishCarrierParityTurn(t, "upstream-call-1")
 	body := carrierParityBody(t, published, inOrder(1), inOrder(1))
 	tampered := strings.Replace(string(body), `"arguments":"{}"`, `"arguments":"{\"symbol\":\"ATTACKER\"}"`, 1)
-	if tampered == string(body) {
-		t.Fatal("fixture no longer carries the arguments this test rewrites")
-	}
 
 	plan, err := translateChatRequestToResponses([]byte(tampered), responsesChatRequestOptions{
 		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
-		CarriedReasoning: carriedForEveryCall(t, route, published, items),
 	})
 	if err != nil {
 		t.Fatalf("translate: %v", err)
@@ -334,6 +370,14 @@ func TestCarrierDoesNotBypassALiveStoresProjectionCheck(t *testing.T) {
 	if input := upstreamInputJSON(t, plan); strings.Contains(input, "OPAQUE") || strings.Contains(input, "upstream-call-1") {
 		t.Fatalf("rewritten arguments were paired with stored state: %s", input)
 	}
+}
+
+func reasoningCiphertext(items []json.RawMessage, value string) []json.RawMessage {
+	replaced := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		replaced[i] = json.RawMessage(strings.Replace(string(item), `"encrypted_content":"OPAQUE"`, `"encrypted_content":"`+value+`"`, 1))
+	}
+	return replaced
 }
 
 // The guards live below the restore, so the carrier path must hit the right one.
