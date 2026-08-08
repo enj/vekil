@@ -261,6 +261,8 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 	// items. Start with the bounded decoded message count and let append grow it;
 	// avoid arithmetic on an untrusted length in the allocation size.
 	input := make([]json.RawMessage, 0, len(messages))
+	// Where each tool turn's items begin, so aged reasoning can be found by index.
+	var toolTurnStarts []int
 	calls := make(map[string]string)
 	results := make(map[string]struct{})
 	restoredGroups := make(map[string]struct{})
@@ -321,6 +323,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				input = appendAssistantHistoryMessage(input, assistantText)
 				continue
 			}
+			toolTurnStarts = append(toolTurnStarts, len(input))
 
 			projected := make([]responsesChatReplayProjectedCall, len(message.ToolCalls))
 			syntheticItems := make([]json.RawMessage, len(message.ToolCalls))
@@ -434,7 +437,54 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].role", index), "unsupported message role")
 		}
 	}
-	return input, nil
+	return trimAgedReasoning(input, toolTurnStarts, options), nil
+}
+
+// Copilot rejects store and previous_response_id, so reasoning rides every later request
+// body. One 1600-turn session accumulated 19 MB of it; a request was refused at 3.1 MB.
+// The newest 100 tool turns measure 705 KB on that session -- 93% off, ample continuity.
+const maxReasoningToolTurns = 100
+
+// Only reasoning is droppable: dropping a function_call instead was measured against
+// Copilot as "No tool call found for function call output".
+func trimAgedReasoning(input []json.RawMessage, toolTurnStarts []int, options responsesChatRequestOptions) []json.RawMessage {
+	if len(toolTurnStarts) <= maxReasoningToolTurns {
+		return input
+	}
+	aged := toolTurnStarts[len(toolTurnStarts)-maxReasoningToolTurns]
+	kept := make([]json.RawMessage, 0, len(input))
+	items, itemBytes := 0, 0
+	for index, item := range input {
+		if index < aged {
+			if itemType, _ := carriedItemHeader(item); itemType == "reasoning" {
+				items++
+				itemBytes += len(item)
+				continue
+			}
+		}
+		kept = append(kept, item)
+	}
+	if items == 0 {
+		return input
+	}
+	logTrimmedReasoning(options, len(toolTurnStarts), items, itemBytes)
+	return kept
+}
+
+// Debug, not warn: past 100 tool turns this is the steady state and fires every turn,
+// where the warns beside it mark continuity vekil expected to keep and lost.
+func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, items, itemBytes int) {
+	if options.Log == nil {
+		return
+	}
+	options.Log.Debug("trimmed reasoning from tool turns older than the retained window",
+		logger.F("model", options.ReplayRoute.PublicModel),
+		logger.F("tool_turns", toolTurns),
+		logger.F("trimmed_turns", toolTurns-maxReasoningToolTurns),
+		logger.F("retained_turns", maxReasoningToolTurns),
+		logger.F("reasoning_items", items),
+		logger.F("reasoning_bytes", itemBytes),
+	)
 }
 
 type responsesChatRestoredCalls struct {
