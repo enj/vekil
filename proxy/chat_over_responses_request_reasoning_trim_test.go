@@ -126,7 +126,11 @@ func trimmableTurnsUpstreamInput(t *testing.T, count int, carrier bool, options 
 	options.UpstreamModel = "gpt-upstream"
 	options.ReplayRoute = route
 	if carrier {
-		options.CarriedReasoning = carried
+		// Production sets both and the store answers first, so the carrier only ever runs
+		// behind a store that has already lost the group: wire one that never held it.
+		expired := newResponsesChatReplayStore()
+		t.Cleanup(func() { _ = expired.Close() })
+		options.CarriedReasoning, options.ReplayStore = carried, expired
 	} else {
 		options.ReplayStore = store
 	}
@@ -155,8 +159,8 @@ func forEachReasoningSource(t *testing.T, run func(t *testing.T, carrier bool)) 
 // the window is N..2N-1, not N.
 func TestTranslateChatMessagesToResponsesDropsReasoningOlderThanRetainedToolTurns(t *testing.T) {
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
-		aged := maxReasoningToolTurns
-		encoded, turns := trimmableTurnsUpstreamInput(t, 2*maxReasoningToolTurns+50, carrier, nil)
+		aged := reasoningToolTurnBlock
+		encoded, turns := trimmableTurnsUpstreamInput(t, 2*reasoningToolTurnBlock+50, carrier, nil)
 		for i, turn := range turns {
 			retained := i >= aged
 			for j, item := range turn.reasoning {
@@ -170,7 +174,7 @@ func TestTranslateChatMessagesToResponsesDropsReasoningOlderThanRetainedToolTurn
 
 func TestTranslateChatMessagesToResponsesKeepsToolCallsAtEveryAge(t *testing.T) {
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
-		encoded, turns := trimmableTurnsUpstreamInput(t, 2*maxReasoningToolTurns+50, carrier, nil)
+		encoded, turns := trimmableTurnsUpstreamInput(t, 2*reasoningToolTurnBlock+50, carrier, nil)
 		previous := -1
 		for i, turn := range turns {
 			call := bytes.Index(encoded, turn.call)
@@ -190,7 +194,7 @@ func TestTranslateChatMessagesToResponsesKeepsToolCallsAtEveryAge(t *testing.T) 
 // exactly what it spliced before it existed, and say nothing.
 func TestTranslateChatMessagesToResponsesLeavesRetainedToolTurnsByteIdentical(t *testing.T) {
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
-		for _, count := range []int{maxReasoningToolTurns, 2*maxReasoningToolTurns - 1} {
+		for _, count := range []int{reasoningToolTurnBlock, 2*reasoningToolTurnBlock - 1} {
 			t.Run(fmt.Sprintf("turns-%d", count), func(t *testing.T) {
 				var sink bytes.Buffer
 				options := responsesChatRequestOptions{Log: logger.NewWithWriter(logger.LevelDebug, &sink)}
@@ -214,44 +218,73 @@ func TestTranslateChatMessagesToResponsesLeavesRetainedToolTurnsByteIdentical(t 
 	})
 }
 
-// Upstream caches on strict prefix: probed, three words changed near the front took a
-// request from 9012 cached tokens to 0. Every request in a block must therefore extend the
-// previous one byte for byte, with one permitted break where the cutoff jumps.
+// Every request in a block must extend the previous one byte for byte; the cutoff, and so
+// the array, may only move where the block does.
 func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlock(t *testing.T) {
+	// Block 2 is the first jump, where the earlier array is still untrimmed; block 3 is the
+	// steady state, where the cutoff is indexed on both sides. Step 7 is a client resuming
+	// several turns on, where a jump need not land on a multiple of the block.
+	sweeps := []struct{ first, last, step int }{
+		{2*reasoningToolTurnBlock - 10, 2*reasoningToolTurnBlock + 15, 1},
+		{3*reasoningToolTurnBlock - 10, 3*reasoningToolTurnBlock + 15, 1},
+		{3*reasoningToolTurnBlock - 14, 3*reasoningToolTurnBlock + 21, 7},
+	}
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
-		first, last := 2*maxReasoningToolTurns-10, 2*maxReasoningToolTurns+15
-		requests := make([][]byte, 0, last-first+1)
-		for count := first; count <= last; count++ {
-			encoded, _ := trimmableTurnsUpstreamInput(t, count, carrier, nil)
-			requests = append(requests, encoded)
-		}
-		var broke []int
-		for i := 1; i < len(requests); i++ {
-			previous, next := requests[i-1], requests[i]
-			// "[a,b]" extends to "[a,b,c]": drop the close, require the separator, so the
-			// break can only land where a whole new item starts.
-			want := append(append([]byte{}, previous[:len(previous)-1]...), ',')
-			if !bytes.HasPrefix(next, want) {
-				broke = append(broke, first+i)
-			}
-		}
-		if len(broke) != 1 || broke[0] != 2*maxReasoningToolTurns {
-			t.Fatalf("prefix broke at turn counts %v, want exactly [%d]", broke, 2*maxReasoningToolTurns)
-		}
-		// The one break must be the cutoff jumping, which drops a block of reasoning: a
-		// break with no drop behind it would be some other divergence wearing the same shape.
-		jump := 2*maxReasoningToolTurns - first
-		if len(requests[jump]) >= len(requests[jump-1]) {
-			t.Fatalf("block jump grew the array %d -> %d, want a drop", len(requests[jump-1]), len(requests[jump]))
+		for _, sweep := range sweeps {
+			t.Run(fmt.Sprintf("from-%d-step-%d", sweep.first, sweep.step), func(t *testing.T) {
+				var previous []byte
+				previousCount := 0
+				for count := sweep.first; count <= sweep.last; count += sweep.step {
+					encoded, _ := trimmableTurnsUpstreamInput(t, count, carrier, nil)
+					if previous != nil {
+						// "[a,b]" extends to "[a,b,c]": drop the close, require the separator, so a
+						// break can only land where a whole new item starts.
+						want := append(append([]byte{}, previous[:len(previous)-1]...), ',')
+						extends := bytes.HasPrefix(encoded, want)
+						// Derived here rather than from agedReasoningToolTurns, so a cutoff that
+						// slid again would be caught instead of agreed with.
+						held := previousCount/reasoningToolTurnBlock == count/reasoningToolTurnBlock
+						if extends != held {
+							t.Fatalf("turns %d -> %d: extends previous = %v, want %v", previousCount, count, extends, held)
+						}
+						// A break must be the cutoff dropping a block of reasoning; one that grew
+						// the array is some other divergence wearing the same shape.
+						if !held && len(encoded) >= len(previous) {
+							t.Fatalf("turns %d -> %d: array grew %d -> %d, want a drop", previousCount, count, len(previous), len(encoded))
+						}
+					}
+					previous, previousCount = encoded, count
+				}
+			})
 		}
 	})
 }
 
+// Two properties the marshaled arrays cannot show: the cutoff never indexes past the turns
+// it was given, and it is a function of the block rather than of the exact count.
+func TestAgedReasoningToolTurnsHoldsStillWithinBlock(t *testing.T) {
+	for _, count := range []int{0, 1, 99, 100, 199, 200, 201, 299, 300, 1516} {
+		aged := agedReasoningToolTurns(count)
+		if count > 0 && aged >= count {
+			t.Fatalf("turns %d: aged = %d, want < %d", count, aged, count)
+		}
+		if count < 2*reasoningToolTurnBlock && aged != 0 {
+			t.Fatalf("turns %d: aged = %d, want 0 below the first jump", count, aged)
+		}
+		if start := agedReasoningToolTurns(count / reasoningToolTurnBlock * reasoningToolTurnBlock); start != aged {
+			t.Fatalf("turns %d: aged = %d but %d at the block start, so the cutoff slides", count, aged, start)
+		}
+		if retained, floor := count-aged, min(count, reasoningToolTurnBlock); retained < floor {
+			t.Fatalf("turns %d: retained %d turns, want at least %d", count, retained, floor)
+		}
+	}
+}
+
 func TestTranslateChatMessagesToResponsesLogsReasoningTrimWithoutContent(t *testing.T) {
 	var sink bytes.Buffer
-	aged := maxReasoningToolTurns
+	aged := reasoningToolTurnBlock
 	options := responsesChatRequestOptions{Log: logger.NewWithWriter(logger.LevelDebug, &sink)}
-	_, turns := trimmableTurnsUpstreamInput(t, 2*maxReasoningToolTurns+50, false, &options)
+	_, turns := trimmableTurnsUpstreamInput(t, 2*reasoningToolTurnBlock+50, false, &options)
 
 	var entry map[string]any
 	if err := json.Unmarshal(sink.Bytes(), &entry); err != nil {

@@ -440,13 +440,13 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 }
 
 // Copilot rejects store and previous_response_id, so reasoning rides every later request
-// body: one 1490-turn session replayed 11.3 MB of it, the newest 100 turns 0.7 MB of that.
-const maxReasoningToolTurns = 100
+// body: one 1490-turn session replayed 11.3 MB of it, a 100-turn block 0.7 MB of that.
+const reasoningToolTurnBlock = 100
 
 // Upstream caches on strict prefix: probed, 3 words changed near the front took cached
 // from 9012 to 0. Quantising holds the cutoff still per block; the window runs N..2N-1.
 func agedReasoningToolTurns(toolTurns int) int {
-	return max(toolTurns/maxReasoningToolTurns-1, 0) * maxReasoningToolTurns
+	return max(toolTurns/reasoningToolTurnBlock-1, 0) * reasoningToolTurnBlock
 }
 
 // Only reasoning is droppable: dropping a function_call instead was measured against
