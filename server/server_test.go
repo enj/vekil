@@ -538,6 +538,145 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 	}
 }
 
+// TestRequestLogWarnsWithErrorDetailOnNonSuccess drives a request that vekil
+// rejects locally and asserts the single request-completed line names why: a 400
+// used to be recorded at info level with a status and a byte count and nothing
+// else, so every rejection had to be reconstructed from the client transcript.
+func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream called at %q; the request must be rejected locally", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	// A replay ID on a route that has no /responses endpoint: an invalid request
+	// carrying all four of type, code, param and message.
+	body := `{"model":"gpt-5","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	entry := requestCompletedLogEntry(t, logs.String())
+	want := map[string]any{
+		"level":         "warn",
+		"msg":           "request completed",
+		"path":          "/v1/chat/completions",
+		"model":         "gpt-5",
+		"error_type":    "invalid_request_error",
+		"error_code":    "responses_replay_state_missing",
+		"error_param":   "messages",
+		"error_message": "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+	}
+	for key, expected := range want {
+		if got := entry[key]; got != expected {
+			t.Fatalf("log[%s] = %#v, want %#v in %#v", key, got, expected, entry)
+		}
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 400 {
+		t.Fatalf("log[status] = %#v, want 400 in %#v", entry["status"], entry)
+	}
+}
+
+// TestErrorEnvelopeFields covers both error shapes vekil emits, plus the bodies
+// that are not envelopes at all: those must raise the level and invent nothing.
+func TestErrorEnvelopeFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want map[string]any
+	}{
+		{
+			name: "openai",
+			body: `{"error":{"message":"boom","type":"invalid_request_error","param":"messages","code":"responses_replay_projection_mismatch"}}`,
+			want: map[string]any{
+				"error_type":    "invalid_request_error",
+				"error_code":    "responses_replay_projection_mismatch",
+				"error_param":   "messages",
+				"error_message": "boom",
+			},
+		},
+		{
+			name: "anthropic",
+			body: `{"type":"error","error":{"type":"invalid_request_error","message":"boom"}}`,
+			want: map[string]any{"error_type": "invalid_request_error", "error_message": "boom"},
+		},
+		{name: "null_code_and_param", body: `{"error":{"message":"boom","type":"t","param":null,"code":null}}`, want: map[string]any{"error_type": "t", "error_message": "boom"}},
+		{name: "empty", body: ``, want: map[string]any{}},
+		{name: "html", body: `<html>gateway</html>`, want: map[string]any{}},
+		{name: "flat_error", body: `{"error":"flat"}`, want: map[string]any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := map[string]any{}
+			for _, field := range errorEnvelopeFields([]byte(tc.body)) {
+				got[field.Key] = field.Value
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("fields = %#v, want %#v", got, tc.want)
+			}
+			for key, want := range tc.want {
+				if got[key] != want {
+					t.Fatalf("fields[%s] = %#v, want %#v", key, got[key], want)
+				}
+			}
+		})
+	}
+}
+
+// TestResponseRecorderRetainsOnlyBoundedErrorBodies pins the capture rule the
+// warn line depends on: success bodies are never held, failures are truncated.
+func TestResponseRecorderRetainsOnlyBoundedErrorBodies(t *testing.T) {
+	success := &responseRecorder{ResponseWriter: httptest.NewRecorder()}
+	success.WriteHeader(http.StatusOK)
+	if _, err := success.Write([]byte(`{"choices":[]}`)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if len(success.errorBody) != 0 {
+		t.Fatalf("success body retained %q", success.errorBody)
+	}
+
+	failure := &responseRecorder{ResponseWriter: httptest.NewRecorder()}
+	failure.WriteHeader(http.StatusBadRequest)
+	for i := 0; i < 4; i++ {
+		if _, err := failure.Write(bytes.Repeat([]byte("x"), maxLoggedErrorBodyBytes)); err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+	}
+	if len(failure.errorBody) != maxLoggedErrorBodyBytes {
+		t.Fatalf("captured %d bytes, want %d", len(failure.errorBody), maxLoggedErrorBodyBytes)
+	}
+}
+
+func requestCompletedLogEntry(t *testing.T, logs string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		if json.Unmarshal([]byte(line), &entry) != nil {
+			continue
+		}
+		if entry["msg"] == "request completed" {
+			return entry
+		}
+	}
+	t.Fatalf("no request-completed log entry in %q", logs)
+	return nil
+}
+
 // TestStreamingChatCompletionsPassthroughThroughServer drives a streaming
 // POST /v1/chat/completions request through the full server stack (so
 // withRequestLog attaches a RequestSummary and the usage callback is non-nil)
