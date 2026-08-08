@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -137,4 +139,82 @@ func jsonStringOf(t *testing.T, value string) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+// A degrade that survives the carrier must say which side of the projection moved, in
+// hashes: the projections themselves are prompt data and must never reach a log.
+func TestDegradeLogNamesTheDivergingSideInHashes(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	emitted := `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`
+	returned := `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`
+	carried, body, callID := clientDriftFixture(t, store, route, "Edit", emitted, returned)
+	requireStoreRejectsArguments(t, store, route, callID, "Edit", returned)
+
+	// A carrier minted under a different route cannot restore, so the turn degrades even
+	// though its content and call sequence are provably unchanged.
+	var logs bytes.Buffer
+	elsewhere := route
+	elsewhere.UpstreamModel = "gpt-other"
+	if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
+		CarriedReasoning: reroutedCarrier(t, carried, elsewhere),
+		Log:              logger.NewWithWriter(logger.LevelInfo, &logs),
+	}); err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+		t.Fatalf("unmarshal %q: %v", logs.String(), err)
+	}
+	if entry["diverged"] != "arguments" {
+		t.Fatalf("log[diverged] = %#v, want %q in %#v", entry["diverged"], "arguments", entry)
+	}
+	projection, _ := entry["projection"].(string)
+	if projection == "" || entry["carried_projection"] != projection {
+		t.Fatalf("matching projections must log as equal hashes: %#v", entry)
+	}
+	for _, leaked := range []string{"checking", "old_string", "/tmp/a"} {
+		if strings.Contains(logs.String(), leaked) {
+			t.Fatalf("degrade log leaked prompt data %q: %s", leaked, logs.String())
+		}
+	}
+}
+
+func reroutedCarrier(t *testing.T, carried map[string]carriedReplay, route responsesChatReplayRoute) map[string]carriedReplay {
+	t.Helper()
+	rerouted := make(map[string]carriedReplay, len(carried))
+	for id, replay := range carried {
+		replay.RouteDigest = carriedRouteDigest(route)
+		rerouted[id] = replay
+	}
+	return rerouted
+}
+
+// Without a carrier there is nothing to narrow the mismatch with, and saying so beats
+// naming a side on no evidence.
+func TestDegradeLogSaysUnknownWithoutACarrier(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	_, drifted, _ := degradeFixture(t, store, route)
+
+	var logs bytes.Buffer
+	if _, err := translateChatRequestToResponses(drifted, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
+		Log: logger.NewWithWriter(logger.LevelInfo, &logs),
+	}); err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+		t.Fatalf("unmarshal %q: %v", logs.String(), err)
+	}
+	if entry["diverged"] != "unknown" || entry["carried_projection"] != "" {
+		t.Fatalf("carrier-less degrade must report unknown: %#v", entry)
+	}
+	if projection, _ := entry["projection"].(string); projection == "" {
+		t.Fatalf("degrade must still log the recomputed projection hash: %#v", entry)
+	}
 }

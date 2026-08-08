@@ -355,7 +355,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				if !isResponsesChatReplayProjectionError(err) {
 					return nil, err
 				}
-				logResponsesChatReplayDegrade(options, len(projected))
+				logResponsesChatReplayDegrade(options, projected, content)
 				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
 				if err != nil {
 					return nil, err
@@ -516,16 +516,43 @@ func isResponsesChatReplayProjectionError(err error) bool {
 	return errors.As(err, &degradable)
 }
 
-func logResponsesChatReplayDegrade(options responsesChatRequestOptions, toolCalls int) {
+func logResponsesChatReplayDegrade(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) {
 	if options.Log == nil {
 		return
 	}
+	projection, carried, diverged := responsesChatReplayDegradeDigests(options, projected, content)
 	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity",
 		logger.F("provider", options.ReplayRoute.ProviderID),
 		logger.F("model", options.ReplayRoute.PublicModel),
 		logger.F("route_id", options.ReplayRoute.RouteID),
-		logger.F("tool_calls", toolCalls),
+		logger.F("tool_calls", len(projected)),
+		logger.F("diverged", diverged),
+		logger.F("projection", projection),
+		logger.F("carried_projection", carried),
 	)
+}
+
+// Digests, never the projections: those are prompt data. A carrier digest that still
+// matches proves the text and the call sequence did not drift, leaving arguments --
+// the one thing the store binds and the carrier does not -- as what the store rejected.
+func responsesChatReplayDegradeDigests(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any) (projection, carried, diverged string) {
+	projectionContent, err := json.Marshal(assistantHistoryText(content))
+	if err != nil {
+		return "", "", "unknown"
+	}
+	canonical, err := canonicalReplayJSONValue(projectionContent)
+	if err != nil {
+		return "", "", "unknown"
+	}
+	projection = carriedProjectionDigest(canonical, projected)
+	replay, ok := carriedReplayForCalls(options.CarriedReasoning, projected)
+	if !ok {
+		return projection, "", "unknown"
+	}
+	if replay.ProjectionDigest == projection {
+		return projection, replay.ProjectionDigest, "arguments"
+	}
+	return projection, replay.ProjectionDigest, "content_or_calls"
 }
 
 func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {
