@@ -396,6 +396,20 @@ func copilotChatProxyOptionWithModelDiscovery(baseURL string) proxy.Option {
 	}}})
 }
 
+func responsesBackedProxyOption(baseURL string) proxy.Option {
+	return proxy.WithProvidersConfig(proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+		ID:       "test-provider",
+		Type:     "openai-compatible",
+		Default:  true,
+		BaseURL:  baseURL,
+		AuthType: "none",
+		Models: []proxy.ProviderModelConfig{{
+			PublicID:  "gpt-5",
+			Endpoints: []string{"/responses"},
+		}},
+	}}})
+}
+
 func TestServerInitializePolicyRoutingDelegatesWhenDisabled(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -517,6 +531,7 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 	}
 	want := map[string]interface{}{
 		"msg":                 "request completed",
+		"level":               "info",
 		"method":              "POST",
 		"path":                "/v1/chat/completions",
 		"endpoint":            "openai_chat",
@@ -538,10 +553,7 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 	}
 }
 
-// TestRequestLogWarnsWithErrorDetailOnNonSuccess drives a request that vekil
-// rejects locally and asserts the single request-completed line names why: a 400
-// used to be recorded at info level with a status and a byte count and nothing
-// else, so every rejection had to be reconstructed from the client transcript.
+// A non-2xx must name why: type, code, param and message on the one line.
 func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream called at %q; the request must be rejected locally", r.URL.Path)
@@ -593,72 +605,119 @@ func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
 	}
 }
 
-// TestErrorEnvelopeFields covers both error shapes vekil emits, plus the bodies
-// that are not envelopes at all: those must raise the level and invent nothing.
-func TestErrorEnvelopeFields(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		body string
-		want map[string]any
-	}{
-		{
-			name: "openai",
-			body: `{"error":{"message":"boom","type":"invalid_request_error","param":"messages","code":"responses_replay_projection_mismatch"}}`,
-			want: map[string]any{
-				"error_type":    "invalid_request_error",
-				"error_code":    "responses_replay_projection_mismatch",
-				"error_param":   "messages",
-				"error_message": "boom",
-			},
-		},
-		{
-			name: "anthropic",
-			body: `{"type":"error","error":{"type":"invalid_request_error","message":"boom"}}`,
-			want: map[string]any{"error_type": "invalid_request_error", "error_message": "boom"},
-		},
-		{name: "null_code_and_param", body: `{"error":{"message":"boom","type":"t","param":null,"code":null}}`, want: map[string]any{"error_type": "t", "error_message": "boom"}},
-		{name: "empty", body: ``, want: map[string]any{}},
-		{name: "html", body: `<html>gateway</html>`, want: map[string]any{}},
-		{name: "flat_error", body: `{"error":"flat"}`, want: map[string]any{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := map[string]any{}
-			for _, field := range errorEnvelopeFields([]byte(tc.body)) {
-				got[field.Key] = field.Value
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("fields = %#v, want %#v", got, tc.want)
-			}
-			for key, want := range tc.want {
-				if got[key] != want {
-					t.Fatalf("fields[%s] = %#v, want %#v", key, got[key], want)
-				}
-			}
-		})
+// End to end: a relayed upstream error must not put its prose on this line.
+func TestRequestLogWithholdsUpstreamAuthoredErrorMessage(t *testing.T) {
+	const secret = "SSN 123-45-6789 from the user prompt"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages","message":"Invalid value for 'messages[0].content': `+secret+`"}}`)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(responsesBackedProxyOption(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	body := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), secret) {
+		t.Fatalf("client no longer receives the upstream message; fixture is stale: %s", w.Body.String())
+	}
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("upstream message leaked into the log: %s", logs.String())
+	}
+	entry := requestCompletedLogEntry(t, logs.String())
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if _, ok := entry["error_message"]; ok {
+		t.Fatalf("log carried error_message for an upstream error: %#v", entry)
 	}
 }
 
-// TestResponseRecorderRetainsOnlyBoundedErrorBodies pins the capture rule the
-// warn line depends on: success bodies are never held, failures are truncated.
-func TestResponseRecorderRetainsOnlyBoundedErrorBodies(t *testing.T) {
-	success := &responseRecorder{ResponseWriter: httptest.NewRecorder()}
-	success.WriteHeader(http.StatusOK)
-	if _, err := success.Write([]byte(`{"choices":[]}`)); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-	if len(success.errorBody) != 0 {
-		t.Fatalf("success body retained %q", success.errorBody)
+// A stream truncated after its 200 was committed is still a failure: the wire
+// status stays 200, so only the summary knows the turn did not survive.
+func TestRequestLogWarnsOnPostCommitStreamFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
 	}
 
-	failure := &responseRecorder{ResponseWriter: httptest.NewRecorder()}
-	failure.WriteHeader(http.StatusBadRequest)
-	for i := 0; i < 4; i++ {
-		if _, err := failure.Write(bytes.Repeat([]byte("x"), maxLoggedErrorBodyBytes)); err != nil {
-			t.Fatalf("Write() error = %v", err)
-		}
+	body := `{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want the committed 200", w.Code)
 	}
-	if len(failure.errorBody) != maxLoggedErrorBodyBytes {
-		t.Fatalf("captured %d bytes, want %d", len(failure.errorBody), maxLoggedErrorBodyBytes)
+	entry := requestCompletedLogEntry(t, logs.String())
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 200 {
+		t.Fatalf("log[status] = %#v, want the committed 200 in %#v", entry["status"], entry)
+	}
+}
+
+// The auth gate rejects before any handler runs; it still has to be logged.
+func TestRequestLogWarnsOnInboundAuthRejection(t *testing.T) {
+	var logs bytes.Buffer
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+		"127.0.0.1",
+		"0",
+		WithInboundAuthToken("secret-token"),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", rec.Code)
+	}
+	entry := requestCompletedLogEntry(t, logs.String())
+	if entry["level"] != "warn" {
+		t.Fatalf("log[level] = %#v, want warn in %#v", entry["level"], entry)
+	}
+	if got, ok := entry["status"].(float64); !ok || got != 401 {
+		t.Fatalf("log[status] = %#v, want 401 in %#v", entry["status"], entry)
+	}
+	if strings.Contains(logs.String(), "secret-token") {
+		t.Fatalf("auth token leaked into the log: %s", logs.String())
 	}
 }
 

@@ -48,6 +48,10 @@ type RequestSummary struct {
 	streamSet                 bool
 	stream                    bool
 	upstreamRequestID         string
+	errorType                 string
+	errorCode                 string
+	errorParam                string
+	errorMessage              string
 	promptTokens              *int
 	completionTokens          *int
 	totalTokens               *int
@@ -511,6 +515,18 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 
 func summaryIntPtr(v int) *int { return &v }
 
+func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.errorType != "" || s.errorCode != "" || s.errorParam != "" || s.errorMessage != "" {
+		return
+	}
+	s.errorType, s.errorCode, s.errorParam, s.errorMessage = errType, code, param, message
+}
+
 // setFailureStatus records an out-of-band failure status (first one wins) for a
 // request whose HTTP status was already committed before the failure was known.
 func (s *RequestSummary) setFailureStatus(status int) {
@@ -673,6 +689,18 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s.statsSuppressed {
 		fields = append(fields, logger.F("stats_suppressed", true))
 	}
+	if s.errorType != "" {
+		fields = append(fields, logger.F("error_type", s.errorType))
+	}
+	if s.errorCode != "" {
+		fields = append(fields, logger.F("error_code", s.errorCode))
+	}
+	if s.errorParam != "" {
+		fields = append(fields, logger.F("error_param", s.errorParam))
+	}
+	if s.errorMessage != "" {
+		fields = append(fields, logger.F("error_message", s.errorMessage))
+	}
 	return fields
 }
 
@@ -771,5 +799,10 @@ func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionE
 		if len(executionErr.Headers) > 0 {
 			summary.setUpstreamRequestID(UpstreamRequestID(executionErr.Headers))
 		}
+		message := executionErr.Message
+		if executionErr.upstreamAuthored {
+			message = ""
+		}
+		summary.setErrorDetail(executionErr.Type, executionErr.Code, executionErr.Param, message)
 	}
 }

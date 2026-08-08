@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +18,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 )
-
-const maxLoggedErrorBodyBytes = 4096
 
 // Server encapsulates the HTTP server lifecycle.
 type Server struct {
@@ -110,9 +107,8 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status    int
-	bytes     int64
-	errorBody []byte
+	status int
+	bytes  int64
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -129,50 +125,10 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 	}
 	n, err := r.ResponseWriter.Write(p)
 	r.bytes += int64(n)
-	r.captureErrorBody(p[:n])
 	return n, err
 }
 
-func (r *responseRecorder) captureErrorBody(p []byte) {
-	if statusIsSuccess(r.status) || len(r.errorBody) >= maxLoggedErrorBodyBytes {
-		return
-	}
-	if room := maxLoggedErrorBodyBytes - len(r.errorBody); len(p) > room {
-		p = p[:room]
-	}
-	r.errorBody = append(r.errorBody, p...)
-}
-
 func statusIsSuccess(status int) bool { return status >= 200 && status < 300 }
-
-// errorEnvelopeFields lifts the four classifier fields; the body itself is never logged.
-func errorEnvelopeFields(body []byte) []logger.Field {
-	var envelope struct {
-		Error struct {
-			Type    string `json:"type"`
-			Code    any    `json:"code"`
-			Param   any    `json:"param"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &envelope) != nil {
-		return nil
-	}
-	var fields []logger.Field
-	if envelope.Error.Type != "" {
-		fields = append(fields, logger.F("error_type", envelope.Error.Type))
-	}
-	if envelope.Error.Code != nil {
-		fields = append(fields, logger.F("error_code", envelope.Error.Code))
-	}
-	if envelope.Error.Param != nil {
-		fields = append(fields, logger.F("error_param", envelope.Error.Param))
-	}
-	if envelope.Error.Message != "" {
-		fields = append(fields, logger.F("error_message", envelope.Error.Message))
-	}
-	return fields
-}
 
 func (r *responseRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
@@ -334,10 +290,10 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 				}
 			}
 			fields = append(fields, summary.LoggerFields()...)
-			if statusIsSuccess(status) {
+			if statusIsSuccess(status) && statsStatus == status {
 				log.Info("request completed", fields...)
 			} else {
-				log.Warn("request completed", append(fields, errorEnvelopeFields(recorder.errorBody)...)...)
+				log.Warn("request completed", fields...)
 			}
 		}
 	})
@@ -381,8 +337,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	httpHandler := withRequestLog(withProviderValidationGate(mux, handler), log, handler)
-	httpHandler = withInboundAuth(httpHandler, cfg.inboundAuthToken)
+	httpHandler := withRequestLog(withInboundAuth(withProviderValidationGate(mux, handler), cfg.inboundAuthToken), log, handler)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,

@@ -25,6 +25,8 @@ type chatExecutionError struct {
 	Headers    http.Header
 	Usage      *models.OpenAIUsage
 	route      resolvedChatRoute
+	// Upstream prose quotes the request back, so only vekil's own Message is loggable.
+	upstreamAuthored bool
 }
 
 func (e *chatExecutionError) Error() string {
@@ -54,8 +56,7 @@ type chatExecutionResult struct {
 	route            resolvedChatRoute
 }
 
-// A force-streamed turn -- which non-streaming Anthropic is -- only learns its
-// carrier while the stream is consumed, so it lands there, not on the result.
+// Non-streaming Anthropic is force-streamed, so its carrier lands on the stream.
 func (r chatExecutionResult) carrier() carriedTurn {
 	if len(r.CarriedReasoning.Items) > 0 {
 		return r.CarriedReasoning
@@ -330,6 +331,8 @@ func responsesChatExecutionErrorFromUpstream(err error) error {
 		Param:      param,
 		Message:    details.message,
 		Headers:    convertedChatSafeHeaders(upstreamErr.headers),
+
+		upstreamAuthored: true,
 	}
 }
 
@@ -522,7 +525,7 @@ func chatExecutionErrorFromStreamTermination(err error) *chatExecutionError {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &chatExecutionError{StatusCode: http.StatusGatewayTimeout, Type: "server_error", Code: "gateway_timeout", Message: "upstream Responses stream timed out"}
 	}
-	return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_stream_failed", Message: err.Error()}
+	return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_stream_failed", Message: err.Error(), upstreamAuthored: true}
 }
 
 func attachChatExecutionErrorUsage(err error, usage *models.OpenAIUsage) {

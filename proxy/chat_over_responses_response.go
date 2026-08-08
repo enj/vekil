@@ -443,7 +443,7 @@ func responsesChatFailedExecutionError(failure *struct {
 		errorType = responsesChatErrorTypeForCode(code)
 	}
 	status := responsesChatFailureStatus(errorType, code)
-	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Message: message, Usage: usage}
+	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Message: message, Usage: usage, upstreamAuthored: true}
 }
 
 func responsesChatErrorTypeForCode(code string) string {
