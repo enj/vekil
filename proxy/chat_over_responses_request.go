@@ -600,15 +600,19 @@ func logResponsesChatReplayDegrade(options responsesChatRequestOptions, projecte
 	if errors.As(err, &degradable) {
 		diverged, carrier = degradable.diverged, degradable.carrier
 	}
-	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity",
+	fields := []logger.Field{
 		logger.F("provider", options.ReplayRoute.ProviderID),
 		logger.F("model", options.ReplayRoute.PublicModel),
-		logger.F("route_id", options.ReplayRoute.RouteID),
 		logger.F("tool_calls", len(projected)),
 		logger.F("diverged", diverged),
 		logger.F("carrier", carrier),
 		logger.F("projection", responsesChatReplayProjectionFingerprint(projected, content)),
-	)
+	}
+	// Only the policy path sets a route id; an empty field reads as data loss.
+	if routeID := options.ReplayRoute.RouteID; routeID != "" {
+		fields = append(fields, logger.F("route_id", routeID))
+	}
+	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
 }
 
 // Vekil's own digest, never the projection itself: that is prompt data.

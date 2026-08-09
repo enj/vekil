@@ -290,6 +290,12 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 				}
 			}
 			fields = append(fields, summary.LoggerFields()...)
+			// A 200 logged at warn means the stream failed after its header was
+			// committed. Without the recorded status that is indistinguishable
+			// from any other warn, which cost a live diagnosis.
+			if statsStatus != status {
+				fields = append(fields, logger.F("stats_status", statsStatus))
+			}
 			if statusIsSuccess(status) && statsStatus == status {
 				log.Info("request completed", fields...)
 			} else {
