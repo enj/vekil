@@ -210,6 +210,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		if resp.StatusCode != http.StatusOK {
 			defer func() { _ = resp.Body.Close() }()
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			// A native Chat route never reaches canonicalizeResponsesChatHTTPError, so
+			// result.upstreamError is empty and this body is the only thing that says why.
+			observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 			detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 			h.log.Error("upstream error",
 				logger.F("endpoint", "gemini"),
@@ -277,6 +280,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	result, oaiBody, mode = h.retryChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode)
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		mergeHeaderValues(w.Header(), result.Headers)
@@ -286,6 +290,10 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		resp := result.Response
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// Same gap as the branch above: observeUpstreamErrorClassifiers already ran, but a
+		// native Chat route left it nothing to record. setErrorDetail is first-wins, so a
+		// Responses-backed route that already classified keeps what it had.
+		observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "gemini"),
