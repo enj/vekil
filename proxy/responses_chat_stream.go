@@ -487,9 +487,19 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	if s.hasSequence && header.SequenceNumber != s.sequence+1 {
-		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses stream sequence is not contiguous")
-	}
+	// WORKAROUND: a gap in sequence_number no longer fails the turn.
+	//
+	// This check alone accounted for every failure in an 11-hour session against a
+	// degraded Copilot: each 15-25 minute turn ended in `502 Responses stream
+	// sequence is not contiguous`, and the work was lost. sequence_number is
+	// tracked here and read nowhere -- nothing orders, dedupes or reassembles by
+	// it -- so tolerating a gap costs nothing downstream, while failing closed
+	// converts a degraded-but-usable stream into a dead turn. The structural
+	// checks that do protect the translation (content-part transitions, item
+	// correlation, terminal events) are deliberately untouched.
+	//
+	// Restore strictness by reinstating the returned error below; the check came
+	// from a569bee (#268), not from the reasoning-carrier work.
 	s.hasSequence = true
 	s.sequence = header.SequenceNumber
 
