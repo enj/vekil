@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sozercan/vekil/models"
@@ -23,6 +24,16 @@ const (
 	responsesChatMaxSSEEventBytes  = openAIStreamScannerMaxBuffer
 	responsesChatReadChunkSize     = responsesPeekReadChunkSize
 )
+
+// keepaliveSampleCaptured guards a one-shot stderr log of the first
+// upstream Responses `keepalive` frame seen by this process. Copilot
+// keepalives fire on every long generation; leaving them silent from
+// the second frame onward avoids log spam while still leaving a
+// single exemplar in the container logs (grep
+// `keepalive_sample_captured=`) so operators can confirm the raw
+// shape when they wonder what Vekil is dropping. Reset (implicitly)
+// on process restart.
+var keepaliveSampleCaptured atomic.Bool
 
 type responsesChatStreamConfig struct {
 	PublicModel        string
@@ -565,9 +576,20 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		// counter was already advanced above so the next real event still
 		// lines up.
 		//
-		// Silent because keepalive fires on every long generation and the
-		// shape is already known; the interesting log path is the default
-		// arm below, which shows anything new.
+		// Silent AFTER the first sample: keepalive fires on every long
+		// generation, so we log the raw frame exactly once per process
+		// start via a package-level atomic flag. That leaves a single
+		// exemplar in the vekil container logs proving the shape without
+		// spamming on every subsequent turn. Grep for
+		// `keepalive_sample_captured=` to find it.
+		if keepaliveSampleCaptured.CompareAndSwap(false, true) {
+			logged := msg.data
+			const maxLoggedBytes = 4096
+			if len(logged) > maxLoggedBytes {
+				logged = logged[:maxLoggedBytes] + "…(truncated)"
+			}
+			fmt.Fprintf(os.Stderr, "keepalive_sample_captured=true data=%s\n", logged)
+		}
 		//
 		// Restore strictness by deleting this case and letting the default
 		// arm fire again.
