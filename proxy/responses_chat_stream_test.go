@@ -284,15 +284,76 @@ func TestResponsesChatStream_IncompleteLength(t *testing.T) {
 	}
 }
 
-func TestResponsesChatStream_UnknownEventFailsBeforeCommit(t *testing.T) {
+// TestResponsesChatStream_UnknownEventNoLongerHardFails covers the
+// change to the default arm of processMessage's switch: previously an
+// unknown event type returned `unsupported_responses_event` and 502'd
+// the client; now it logs the full frame to stderr and drops. The
+// fixture stops mid-stream on an unknown event so we still expect an
+// eventual error (the stream ended without a terminal frame), but
+// the specific error code must NOT be `unsupported_responses_event`.
+func TestResponsesChatStream_UnknownEventNoLongerHardFails(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_malformed_unknown_event.sse")
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
-	if stream != nil {
-		t.Fatal("stream is non-nil")
+	// The stream should either succeed or fail with a different code
+	// (e.g. `invalid_responses_stream` because the fixture ends without
+	// response.completed). What must NOT happen is a hard 502 with
+	// `unsupported_responses_event` for the synthetic unknown event
+	// type — that's the failure mode this change eliminates.
+	if err == nil {
+		return
 	}
 	var executionErr *chatExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_event" {
-		t.Fatalf("error = %#v", err)
+	if errors.As(err, &executionErr) && executionErr.Code == "unsupported_responses_event" {
+		t.Fatalf("unsupported_responses_event returned to client; the default arm should drop-and-log instead. error = %#v", err)
+	}
+	_ = stream
+}
+
+// TestResponsesChatStream_KeepaliveIsDropped exercises the WORKAROUND in
+// processMessage(): Copilot's Responses upstream emits `event: keepalive`
+// mid-2026 to prevent proxy timeouts on long generations. Without the
+// case-arm added in the same commit, this stream would return
+// `unsupported_responses_event` and 502 to the client. With the arm,
+// the keepalive is silently dropped, sequence tracking still advances,
+// and the surrounding real events reach the client normally.
+func TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents(t *testing.T) {
+	fixture := []byte("event: response.created\n" +
+		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ka","created_at":1700000003,"status":"in_progress"}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"in_progress","role":"assistant","content":[]}}` + "\n\n" +
+		"event: response.content_part.added\n" +
+		`data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":3}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_ka","output_index":0,"content_index":0,"delta":"hello"}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":5}` + "\n\n" +
+		"event: response.output_text.done\n" +
+		`data: {"type":"response.output_text.done","sequence_number":6,"item_id":"msg_ka","output_index":0,"content_index":0,"text":"hello"}` + "\n\n" +
+		"event: response.content_part.done\n" +
+		`data: {"type":"response.content_part.done","sequence_number":7,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","sequence_number":8,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_ka","created_at":1700000003,"status":"completed","output":[{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}` + "\n\n")
+	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("prepareResponsesChatStream returned error: %v", err)
+	}
+	chunks := collectResponsesChatStreamChunks(t, stream)
+	if len(chunks) == 0 {
+		t.Fatal("expected at least one chunk, got none — keepalive likely broke the stream")
+	}
+	// The keepalive must NOT surface a chunk of its own; only the real
+	// delta ("hello") should reach the client. Sum the text chunks and
+	// assert we got exactly "hello".
+	var text string
+	for _, chunk := range chunks {
+		text += streamChunkText(t, chunk)
+	}
+	if text != "hello" {
+		t.Fatalf("assembled text = %q, want %q", text, "hello")
 	}
 }
 

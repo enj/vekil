@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -547,8 +548,56 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_text.delta",
 		"response.reasoning_text.done":
 		return s.handleReasoningProgress(eventType, []byte(msg.data))
+	case "keepalive":
+		// WORKAROUND: silently drop the SSE keepalive frame.
+		//
+		// Copilot's Responses upstream started emitting `event: keepalive`
+		// mid-2026 to prevent proxy timeouts on long generations. It carries
+		// {"type":"keepalive", "sequence_number":N} but no other state. The
+		// existing whitelist doesn't know it and returns 502 to the client
+		// (`upstream Responses event "keepalive" is not supported`), which
+		// converts a liveness signal into a dead turn.
+		//
+		// Vekil's own upstream connection is kept alive by the active read
+		// loop; the downstream connection to the Anthropic-format client is
+		// almost always same-host loopback (no proxy hop). Dropping is
+		// therefore safe -- no client needs the frame -- and the sequence
+		// counter was already advanced above so the next real event still
+		// lines up.
+		//
+		// Silent because keepalive fires on every long generation and the
+		// shape is already known; the interesting log path is the default
+		// arm below, which shows anything new.
+		//
+		// Restore strictness by deleting this case and letting the default
+		// arm fire again.
+		return responsesChatStreamTransition{}, nil
 	default:
-		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
+		// WORKAROUND: log the full frame and drop, rather than 502.
+		//
+		// Copilot's Responses upstream keeps adding new event types
+		// (`keepalive` was one; more will follow). A hard 502 on the first
+		// occurrence converts a purely informational frame into a dead turn
+		// for every affected client. Downgrade to a stderr log of the
+		// entire event (type + raw JSON data, capped so a pathological
+		// upstream can't spam our log volume) and drop.
+		//
+		// The log line is the diagnostic signal a future maintainer needs:
+		// grep `unhandled_responses_event=` in the vekil container logs to
+		// see the exact JSON shape of any new event type, then add a
+		// dedicated case arm above with the right handling. Sequence
+		// tracking was already advanced above so dropping does not break
+		// contiguity.
+		//
+		// Restore strictness (2026-vintage behaviour) by deleting this arm
+		// and reverting to `return ..., newChatServerError(...)`.
+		const maxLoggedBytes = 4096
+		logged := msg.data
+		if len(logged) > maxLoggedBytes {
+			logged = logged[:maxLoggedBytes] + "…(truncated)"
+		}
+		fmt.Fprintf(os.Stderr, "unhandled_responses_event=%q data=%s\n", eventType, logged)
+		return responsesChatStreamTransition{}, nil
 	}
 }
 
