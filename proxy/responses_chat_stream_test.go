@@ -296,6 +296,47 @@ func TestResponsesChatStream_UnknownEventFailsBeforeCommit(t *testing.T) {
 	}
 }
 
+// TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents: Copilot
+// emits `event: keepalive` during long generations; the case arm drops
+// it and lets the surrounding text still assemble.
+func TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents(t *testing.T) {
+	fixture := []byte("event: response.created\n" +
+		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ka","created_at":1700000003,"status":"in_progress"}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"in_progress","role":"assistant","content":[]}}` + "\n\n" +
+		"event: response.content_part.added\n" +
+		`data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":3}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_ka","output_index":0,"content_index":0,"delta":"hello"}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":5}` + "\n\n" +
+		"event: response.output_text.done\n" +
+		`data: {"type":"response.output_text.done","sequence_number":6,"item_id":"msg_ka","output_index":0,"content_index":0,"text":"hello"}` + "\n\n" +
+		"event: response.content_part.done\n" +
+		`data: {"type":"response.content_part.done","sequence_number":7,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","sequence_number":8,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_ka","created_at":1700000003,"status":"completed","output":[{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}` + "\n\n")
+	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("prepareResponsesChatStream returned error: %v", err)
+	}
+	chunks := collectResponsesChatStreamChunks(t, stream)
+	var text string
+	for _, chunk := range chunks {
+		if len(chunk.Choices) == 0 || len(chunk.Choices[0].Delta.Content) == 0 {
+			continue
+		}
+		text += streamChunkText(t, chunk)
+	}
+	if text != "hello" {
+		t.Fatalf("assembled text = %q, want %q", text, "hello")
+	}
+}
+
 func TestResponsesChatStream_PostcommitFailureCarriesUsageAndTypedError(t *testing.T) {
 	fixture := []byte("event: response.created\n" +
 		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_post_failure","created_at":1700000002,"status":"in_progress"}}` + "\n\n" +
