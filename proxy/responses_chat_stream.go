@@ -547,17 +547,16 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		// Copilot Responses upstream emits during long generations; no state carried, drop.
 		return responsesChatStreamTransition{}, nil
 	default:
-		// Log before the 502 so a new upstream event type is diagnosable from container logs.
+		// Log bounded metadata so new event types are diagnosable without exposing payloads.
 		if s.config.Carrier.Log != nil {
-			const maxLoggedBytes = 4096
-			preview := msg.data
-			if len(preview) > maxLoggedBytes {
-				preview = preview[:maxLoggedBytes]
+			const maxLoggedEventTypeBytes = 128
+			loggedEventType := eventType
+			if len(loggedEventType) > maxLoggedEventTypeBytes {
+				loggedEventType = strings.ToValidUTF8(loggedEventType[:maxLoggedEventTypeBytes], "")
 			}
 			s.config.Carrier.Log.Warn("unhandled upstream Responses event",
-				logger.F("event_type", eventType),
+				logger.F("event_type", loggedEventType),
 				logger.F("data_bytes", len(msg.data)),
-				logger.F("data_preview", preview),
 			)
 		}
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
