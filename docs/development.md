@@ -155,6 +155,30 @@ Record the full baseline SHA, candidate SHA, Go version, OS/architecture, `GOMAX
 
 `BenchmarkChatRouteLegacyDirectResolutionRequestBuild` and `BenchmarkChatRouteExplicitPriorityOneTargetRequestBuild` provide the direct legacy-versus-route request-build baseline. `BenchmarkChatRouteLegacyDirectTransport` and `BenchmarkChatRouteExplicitPrimaryOnlyTransport` add deterministic `http.Client`/`RoundTripper` dispatch coverage without network variability. `BenchmarkExplicitRoutePreparedStreamTTFT` measures held-preamble handoff and reports `ttft-ns/op`; `BenchmarkRouteAttemptStatsConcurrentContention` measures concurrent physical-attempt accounting; and `BenchmarkExplicitRouteTwoTargetFailover64MiB` verifies exactly two sends and reports allocation pressure at the maximum request boundary. These checked-in benchmarks provide the scenarios, but the ten-sample baseline/candidate `benchstat` comparison remains release evidence that must be captured on a controlled machine rather than asserted from one local run.
 
+### Native Responses transport benchmark
+
+`BenchmarkResponsesTransportNativeUpstream` compares the default HTTP bridge
+with an established native websocket using the same fixed 400-message history.
+It reports uploaded bytes per continuation along with latency and allocations:
+
+```bash
+GOMAXPROCS=8 go test ./proxy -run '^$' -bench '^BenchmarkResponsesTransportNativeUpstream$' -benchmem -count=3
+```
+
+On an Apple M1 Max, darwin/arm64, Go 1.27.1, three one-second local samples
+measured:
+
+| Transport | Uploaded bytes/turn | Time/turn | Allocated bytes/turn |
+|-----------|--------------------:|----------:|---------------------:|
+| HTTP bridge | 140,921 | 591 to 653 µs | 318 to 320 KB |
+| Native websocket | 176 | 173 to 178 µs | about 119 KB |
+
+Both endpoints are local deterministic fixtures. These numbers cover warm
+transport and history construction; they do not establish live provider latency,
+quota changes, model performance, or reconnect behavior. The native transport
+remains opt-in, and its [session limits](responses-websocket.md#experimental-native-upstream-transport)
+are part of the compatibility contract.
+
 ## Policy evaluation and release evidence
 
 Policy enforcement is an operator release gate, not an automatic consequence of merging the implementation. Keep the global ceiling `off` until all evaluation criteria in [Semantic Policy Routing](policy-routing.md#evaluation-gates-before-enforcement) pass.
@@ -349,6 +373,11 @@ For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../s
 The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks** — unlike the Copilot smoke, which self-skips on forks. It is the only live end-to-end coverage of vekil's generic `openai-compatible` provider routing (config loading, bearer auth, static model catalog, and the per-model endpoint allowlist), which zero-config Copilot startup never exercises.
 
 Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
+
+CI copies the single-provider example into a temporary config and adds
+`User-Agent: vekil-live-smoke/1` plus one UUID in `x-opencode-session` for the
+smoke run. The stable session header lets the upstream retain routing and cache
+affinity. The generated config is validated offline before the proxy starts.
 
 The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; a free `/messages` model requires an explicit provider-design change instead of being silently emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
 

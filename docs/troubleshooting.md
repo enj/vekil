@@ -4,6 +4,41 @@ Start with the status code or error text shown by the client. Each entry explain
 what the error means, what to try first, how to confirm recovery, and what to
 capture if it keeps happening.
 
+## `429`: upstream rate limit
+
+Keep the `Retry-After` response header. Vekil preserves long resets and returns
+the upstream response immediately when another attempt cannot fit within the
+request timeout. It also honors `retry-after-ms` and exhausted quota reset
+headers. Increasing the timeout does not increase the upstream quota.
+
+For recognized Copilot limits with a valid reset, Vekil shares a process-local
+cooldown across affected requests. Model limits apply to that model and
+credential, account and weekly limits apply across models for that credential,
+and integration limits apply to that integration within the configured provider.
+An active cooldown returns 429 without sending another inference request. After
+the reset, one request probes availability before queued callers continue.
+Cooldown records are bounded and lost on restart.
+
+The same rules apply when a Chat, native Messages, or Responses stream returns a
+structured throttle after HTTP `200`. This includes Responses-backed Chat and
+requests streamed internally for tool-call aggregation. Responses errors can
+supply reset headers in the stream itself.
+A recovery probe that repeats the throttle renews the cooldown before queued
+requests continue. An already-started client stream reports the error in its
+stream; a non-streaming request returns `429`.
+
+Configured priority failover can still use an unaffected compatible target.
+Requests with provider-bound state retain their selected target. Switching models
+within the same account does not avoid an account or weekly cooldown.
+
+Requests waiting for a recovery probe honor disconnects, request deadlines, and
+shutdown. The number of waiters is bounded; excess requests receive 503.
+
+To investigate repeated throttling, record the error code, reset, timestamp, and
+`X-Copilot-Service-Request-Id` when present. Quota snapshot and usage-rate-limit
+headers provide additional account-specific diagnostics. Avoid sharing request
+contents or credentials.
+
 ## `408 user_request_timeout`: timed out reading request body
 
 ### Symptom

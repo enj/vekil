@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sozercan/vekil/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -2508,17 +2509,18 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		var token string
+		var credential auth.Credential
 		var err error
 		if endpoint == providerEndpointResponses {
-			token, err = h.auth.GetResponsesToken(req.Context())
+			credential, err = h.auth.GetResponsesCredential(req.Context())
 		} else {
-			token, err = h.auth.GetToken(req.Context())
+			credential, err = h.auth.GetCredential(req.Context())
 		}
 		if err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
-		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
+		h.setCopilotHeadersForProvider(req, credential.Token, provider, endpoint)
+		*req = *req.WithContext(context.WithValue(req.Context(), copilotSourceFingerprintContextKey{}, credential.SourceFingerprint))
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
@@ -2671,6 +2673,10 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // common path does not need a per-attempt header-map clone. Client.Do adds jar
 // cookies to the request header, so clients with a cookie jar retain isolation.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	body, err := applyAnthropicChatCacheControl(ctx, provider, path, body)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
 		// Inference retries reserve every physical send explicitly. Disable the
@@ -2684,6 +2690,8 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		if client != nil && client.Jar != nil {
 			req.Header = shallowCloneHeader(req.Header)
 		}
+		req = withCopilotInferenceRequest(req, provider, path, body, owners...)
+		req = withTaskInferenceRequest(req, path)
 	}
 	return req, err
 }

@@ -314,12 +314,14 @@ func observeResponsesUsage(ctx context.Context, usage responsesUsage) {
 // cached-prompt detail; Anthropic does not report a separate reasoning count.
 func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 	var parsed struct {
-		Usage models.AnthropicUsage `json:"usage"`
+		Usage        models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage       `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return
 	}
 	observeAnthropicUsage(ctx, parsed.Usage)
+	observeCopilotUsage(ctx, parsed.CopilotUsage)
 }
 
 func observeAnthropicUsage(ctx context.Context, u models.AnthropicUsage) {
@@ -360,16 +362,17 @@ type anthropicStreamUsageAccumulator struct {
 	haveOutput    bool
 }
 
-func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
+func (a *anthropicStreamUsageAccumulator) observe(data []byte) json.RawMessage {
 	var event struct {
 		Type    string `json:"type"`
 		Message *struct {
 			Usage *models.AnthropicUsage `json:"usage"`
 		} `json:"message"`
-		Usage *models.AnthropicUsage `json:"usage"`
+		Usage        *models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage        `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
-		return
+		return event.CopilotUsage
 	}
 	switch event.Type {
 	case "message_start":
@@ -389,6 +392,7 @@ func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
 			a.haveOutput = true
 		}
 	}
+	return event.CopilotUsage
 }
 
 // anthropicStreamErrorStatus inspects an Anthropic SSE data payload and, if it
@@ -401,6 +405,7 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 		Type  string `json:"type"`
 		Error *struct {
 			Type string `json:"type"`
+			Code string `json:"code"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
@@ -412,6 +417,10 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 	errType := ""
 	if event.Error != nil {
 		errType = strings.ToLower(strings.TrimSpace(event.Error.Type))
+		switch strings.ToLower(strings.TrimSpace(event.Error.Code)) {
+		case "user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
+			return http.StatusTooManyRequests, true
+		}
 	}
 	switch errType {
 	case "rate_limit_error", "rate_limit_exceeded":
