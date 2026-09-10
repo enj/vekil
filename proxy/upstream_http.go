@@ -75,7 +75,13 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
 	lifecycle := h.lifecycleContextForRetryStats(isRetryStatsTracked(inbound))
-	return h.newLifecycleUpstreamContextFrom(lifecycle, timeout)
+	lifecycle = copyCopilotRequestMetadataContext(lifecycle, inbound)
+	lifecycle = copyTaskInferenceContext(lifecycle, inbound)
+	ctx, cancel := h.newLifecycleUpstreamContextFrom(lifecycle, timeout)
+	if inbound != nil && inbound.Done() != nil {
+		ctx = context.WithValue(ctx, copilotAdmissionInboundContextKey{}, inbound)
+	}
+	return ctx, cancel
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -574,7 +580,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 	if err != nil {
 		return nil, err
 	}
-	if provider.kind != providerTypeAnthropicCompatible {
+	if provider.kind != providerTypeAnthropicCompatible && provider.kind != providerTypeCopilot {
 		return nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("provider %q does not support %s", provider.id, providerEndpointMessagesCount),
@@ -667,6 +673,7 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 // responses fail open to passthrough behavior.
 func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
 	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+		observeChatCopilotUsage(ctx, body)
 		if usage, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, requestedModel); canonical {
 			observeOpenAIUsage(ctx, &usage)
 			return body, false
@@ -683,6 +690,7 @@ func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w 
 
 func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) error {
 	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+		observeChatCopilotUsage(ctx, body)
 		observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
 		return body, false
 	})
@@ -1003,6 +1011,10 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 			if inspection, ok := inspectAnthropicResponseJSONFast(body); ok {
 				fastUsage = inspection.usage
 				fastUsageParsed = inspection.usageParsed
+				if resp.StatusCode == http.StatusOK && fastUsageParsed {
+					// Observe before an in-place model rewrite can move the billing bytes.
+					observeCopilotUsage(ctx, inspection.copilotUsage)
+				}
 				rewritten, changed, err = rewriteAnthropicResponseModelJSONInPlaceInspected(body, publicModel, upstreamModel, inspection)
 				if err != nil {
 					return newResponseBodyWriteError(resp, err, false, true, false)
@@ -1244,6 +1256,7 @@ type anthropicResponseJSONInspection struct {
 	rewriteModel bool
 	usage        models.AnthropicUsage
 	usageParsed  bool
+	copilotUsage json.RawMessage
 }
 
 func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspection, bool) {
@@ -1305,6 +1318,8 @@ func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspect
 			inspection.usage = usage
 		case rawJSONKeyEqualFold(key, "usage"):
 			inspection.usageParsed = false
+		case rawJSONKeyEqualFold(key, "copilot_usage"):
+			inspection.copilotUsage = body[start:end]
 		}
 	}
 	return inspection, true

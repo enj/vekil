@@ -810,9 +810,13 @@ func TestParseRetryAfter(t *testing.T) {
 		{"abc", 0, false},
 		{"5", 5 * time.Second, true},
 		{"120", 120 * time.Second, true},
-		{"999999", maxRetryAfter, true},
-		{"10000000000", maxRetryAfter, true},
-		{"9223372036854775808", maxRetryAfter, true},
+		{"86400", 24 * time.Hour, true},
+		{"604800", 7 * 24 * time.Hour, true},
+		{"999999", 999999 * time.Second, true},
+		{"9223372036", 9223372036 * time.Second, true},
+		{"9223372037", maxRetryAfterDuration, true},
+		{"10000000000", maxRetryAfterDuration, true},
+		{"9223372036854775808", maxRetryAfterDuration, true},
 		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, false},
 	}
 
@@ -826,15 +830,15 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestParseRetryAfterVeryLongDecimalRemainsInternallyCapped(t *testing.T) {
+func TestParseRetryAfterVeryLongDecimalSaturatesDurationWithoutOverflow(t *testing.T) {
 	value := strings.Repeat("9", 64*1024)
 	delay, ok := parseRetryAfter(value)
-	if !ok || delay != maxRetryAfter {
-		t.Fatalf("parseRetryAfter(%d-digit decimal) = (%v, %v), want (%v, true)", len(value), delay, ok, maxRetryAfter)
+	if !ok || delay != maxRetryAfterDuration {
+		t.Fatalf("parseRetryAfter(%d-digit decimal) = (%v, %v), want (%v, true)", len(value), delay, ok, maxRetryAfterDuration)
 	}
 }
 
-func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
+func TestParseRetryAfter_HTTPDatePreservesLongReset(t *testing.T) {
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	dur, ok := parseRetryAfter(future)
 	if !ok {
@@ -846,8 +850,8 @@ func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
 
 	farFuture := time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)
 	dur, ok = parseRetryAfter(farFuture)
-	if !ok || dur != maxRetryAfter {
-		t.Fatalf("far future duration = (%v, %v), want (%v, true)", dur, ok, maxRetryAfter)
+	if !ok || dur < 24*time.Hour-2*time.Second || dur > 24*time.Hour {
+		t.Fatalf("far future duration = (%v, %v), want about 24 hours", dur, ok)
 	}
 }
 
@@ -859,7 +863,7 @@ func TestDurationSecondsCeil(t *testing.T) {
 		{delay: 500 * time.Millisecond, want: 1},
 		{delay: time.Second, want: 1},
 		{delay: 1500 * time.Millisecond, want: 2},
-		{delay: maxRetryAfter, want: 300},
+		{delay: 5 * time.Minute, want: 300},
 	}
 	for _, tt := range tests {
 		if got := durationSecondsCeil(tt.delay); got != tt.want {
@@ -1100,9 +1104,13 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 		name       string
 		status     int
 		cancelWhen string
+		headers    http.Header
 	}{
 		{name: "429 before drain", status: http.StatusTooManyRequests, cancelWhen: "before-drain"},
 		{name: "503 during backoff", status: http.StatusServiceUnavailable, cancelWhen: "backoff"},
+		{name: "malformed retry delay before drain", status: http.StatusTooManyRequests, cancelWhen: "before-drain", headers: http.Header{"Retry-After": {"invalid"}, "Retry-After-Ms": {"2000"}}},
+		{name: "malformed retry delay during backoff", status: http.StatusServiceUnavailable, cancelWhen: "backoff", headers: http.Header{"Retry-After": {"invalid"}, "Retry-After-Ms": {"2000"}}},
+		{name: "malformed retry delay with exhausted quota", status: http.StatusTooManyRequests, cancelWhen: "backoff", headers: http.Header{"Retry-After": {"invalid"}, "X-Ratelimit-Remaining-Requests": {"0"}, "X-Ratelimit-Reset-Requests": {"2"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			responseReady := make(chan struct{})
@@ -1120,6 +1128,9 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 						},
 						Body:    body,
 						Request: req,
+					}
+					for name, values := range tt.headers {
+						resp.Header[name] = values
 					}
 					if tt.cancelWhen == "before-drain" {
 						close(responseReady)
@@ -1162,6 +1173,11 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 			}
 			if upstreamErr.retryAfter != "2" || upstreamErr.headers.Get("X-Upstream-Status") != "preserved" {
 				t.Fatalf("upstream metadata = retry-after:%q headers:%v", upstreamErr.retryAfter, upstreamErr.headers)
+			}
+			w := httptest.NewRecorder()
+			writeOpenAIUpstreamRequestFailure(w, upstreamErr.statusCode, err)
+			if got := w.Header().Get("Retry-After"); got != "2" {
+				t.Fatalf("translated Retry-After = %q, want 2", got)
 			}
 			if errors.Is(err, context.Canceled) {
 				t.Fatalf("retryable status was replaced by shutdown cancellation: %v", err)

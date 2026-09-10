@@ -43,6 +43,7 @@ type geminiCountTokensCacheEntry struct {
 // HandleGeminiModels routes Gemini-native model actions to the corresponding
 // translation handler.
 func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	model, action, err := parseGeminiPath(r.URL.Path)
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
@@ -178,13 +179,15 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
 		}
 
 		if mode.forceUpstreamStream {
-			oaiResp, finalResp, aggregateErr := h.aggregateExplicitChatCompletionsResponse(upstreamCtx, resp, oaiBody, mode, aggregateGeminiStreamToResponseWithProgress)
+			var successfulHeaders http.Header
+			oaiResp, finalResp, aggregateErr := h.aggregateExplicitChatCompletionsResponse(upstreamCtx, resp, oaiBody, mode, aggregateGeminiStreamToResponseWithProgress, &successfulHeaders)
 			if aggregateErr != nil {
 				if h.handleShutdownError(w, r, upstreamCtx, aggregateErr) {
 					return
@@ -195,6 +198,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				if errors.As(aggregateErr, &streamErr) {
 					status = streamErr.httpStatus()
 					message = streamErr.Error()
+					mergeHeaderValues(w.Header(), streamErr.headers)
 				}
 				writeGeminiError(w, status, mapGeminiUpstreamStatus(status), message)
 				return
@@ -202,11 +206,13 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			if finalResp != nil {
 				resp = finalResp
 			} else {
+				mergeHeaderValues(w.Header(), convertedChatSafeHeaders(successfulHeaders))
 				writeAggregatedResponse(oaiResp)
 				return
 			}
 		}
 
+		mergeHeaderValues(w.Header(), convertedChatSafeHeaders(resp.Header))
 		if resp.StatusCode != http.StatusOK {
 			defer func() { _ = resp.Body.Close() }()
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -241,6 +247,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 					return err
 				}
 				observeOpenAIUsage(r.Context(), parsed.Usage)
+				observeCopilotUsage(r.Context(), parsed.CopilotUsage)
 				h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, false)
 
 				markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
@@ -281,7 +288,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	observeChatExecutionRoute(r.Context(), result)
 	result.observeUpstreamError(r.Context())
 	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
-	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
+	if len(result.Headers) > 0 {
 		mergeHeaderValues(w.Header(), result.Headers)
 	}
 
@@ -306,6 +313,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
 		observeOpenAIUsage(r.Context(), oaiResp.Usage)
+		observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 		h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
@@ -362,8 +370,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	if result.Stream != nil {
 		tracked := &commitTrackingResponseWriter{ResponseWriter: w}
 		err := streamChatEventsToGemini(tracked, result.Stream, chatStreamEventCallbacks{
-			OnUsage: openAIChatStreamUsageCallback(r.Context()),
-			OnFinal: h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+			OnUsage:        openAIChatStreamUsageCallback(r.Context()),
+			OnCopilotUsage: func(raw json.RawMessage) { observeCopilotUsage(r.Context(), raw) },
+			OnFinal:        h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 		})
 		if h.handleCanonicalChatStreamLifecycleError(w, r, upstreamCtx, tracked.committed, err, func() {
 			_ = writeGeminiSSEData(tracked, models.GeminiErrorResponse{
@@ -405,6 +414,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				return err
 			}
 			observeOpenAIUsage(r.Context(), parsed.Usage)
+			observeCopilotUsage(r.Context(), parsed.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, false)
 
 			w.Header().Set("Content-Type", "application/json")
@@ -421,6 +431,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 }
 
 func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
+	r = r.WithContext(withTaskInferenceKind(r.Context(), taskTokenCount))
 	body, err := readBody(r)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
@@ -449,7 +460,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 	h.observeRequestSummary(r.Context(), "gemini_count_tokens", pathModel, false, providerEndpointChatCompletions)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)
@@ -853,6 +864,10 @@ func (h *ProxyHandler) writeGeminiProtocolError(w http.ResponseWriter, err error
 }
 
 func (h *ProxyHandler) writeGeminiUpstreamFailure(w http.ResponseWriter, err error) {
+	var upstreamErr *upstreamError
+	if errors.As(err, &upstreamErr) {
+		mergeHeaderValues(w.Header(), convertedChatSafeHeaders(upstreamErr.headers))
+	}
 	writeErr := mapGeminiTransportError(err)
 	h.writeGeminiProtocolError(w, writeErr)
 }

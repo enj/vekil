@@ -98,13 +98,13 @@ func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *ch
 	ctx, cancel := context.WithCancelCause(parent)
 	events := make(chan chatStreamEvent, chatStreamEventBufferSize)
 	return &chatStreamEventWriter{
-			ctx:    ctx,
-			events: events,
-		}, &chatStreamEventStream{
-			ctx:    ctx,
-			cancel: cancel,
-			events: events,
-		}
+		ctx:    ctx,
+		events: events,
+	}, &chatStreamEventStream{
+		ctx:    ctx,
+		cancel: cancel,
+		events: events,
+	}
 }
 
 func (w *chatStreamEventWriter) sendChunk(chunk models.OpenAIStreamChunk) error {
@@ -243,9 +243,10 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 }
 
 type chatStreamEventCallbacks struct {
-	DropUsage bool
-	OnUsage   func(*models.OpenAIUsage)
-	OnFinal   func(*models.OpenAIResponse)
+	DropUsage      bool
+	OnUsage        func(*models.OpenAIUsage)
+	OnCopilotUsage func(json.RawMessage)
+	OnFinal        func(*models.OpenAIResponse)
 }
 
 func selectChatStreamEventCallbacks(callbacks []chatStreamEventCallbacks) chatStreamEventCallbacks {
@@ -281,6 +282,9 @@ func streamChatEventsToOpenAI(w http.ResponseWriter, stream *chatStreamEventStre
 	}
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
@@ -288,7 +292,10 @@ func streamChatEventsToOpenAI(w http.ResponseWriter, stream *chatStreamEventStre
 			addChatStreamChunkForToolCapture(aggregator, chunk)
 		}
 		if callbacks.DropUsage && chunk.Usage != nil && len(chunk.Choices) == 0 {
-			return nil
+			if rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+				return nil
+			}
+			chunk.Usage = nil
 		}
 		if err := writeOpenAIChatSSEData(w, chunk); err != nil {
 			return errors.Join(errChatStreamClientWriteFailed, err)
@@ -427,6 +434,9 @@ func streamChatEventsToAnthropic(
 	}
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
@@ -471,6 +481,9 @@ func streamChatEventsToGemini(w http.ResponseWriter, stream *chatStreamEventStre
 	state := newGeminiStreamState(w)
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
