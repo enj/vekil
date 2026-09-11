@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -542,7 +543,22 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_text.delta",
 		"response.reasoning_text.done":
 		return s.handleReasoningProgress(eventType, []byte(msg.data))
+	case "keepalive":
+		// Copilot Responses upstream emits during long generations; no state carried, drop.
+		return responsesChatStreamTransition{}, nil
 	default:
+		// Log bounded metadata so new event types are diagnosable without exposing payloads.
+		if s.config.Carrier.Log != nil {
+			const maxLoggedEventTypeBytes = 128
+			loggedEventType := eventType
+			if len(loggedEventType) > maxLoggedEventTypeBytes {
+				loggedEventType = strings.ToValidUTF8(loggedEventType[:maxLoggedEventTypeBytes], "")
+			}
+			s.config.Carrier.Log.Warn("unhandled upstream Responses event",
+				logger.F("event_type", loggedEventType),
+				logger.F("data_bytes", len(msg.data)),
+			)
+		}
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
 	}
 }

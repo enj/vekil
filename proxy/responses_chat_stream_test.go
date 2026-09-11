@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -322,6 +323,131 @@ func TestResponsesChatStream_UnknownEventFailsBeforeCommit(t *testing.T) {
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "unsupported_responses_event" {
 		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestResponsesChatStream_UnknownEventLogsOnlyBoundedMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		eventType      string
+		wantLoggedType string
+	}{
+		{"private payload", "response.future_event", "response.future_event"},
+		{"at limit", strings.Repeat("x", 128), strings.Repeat("x", 128)},
+		{"over limit", strings.Repeat("x", 129), strings.Repeat("x", 128)},
+		{"large event", strings.Repeat("x", 2<<20), strings.Repeat("x", 128)},
+		{"Unicode at limit", strings.Repeat("x", 125) + "☃", strings.Repeat("x", 125) + "☃"},
+		{"Unicode across limit", strings.Repeat("x", 127) + "☃", strings.Repeat("x", 127)},
+		{"JSON escaping", strings.Repeat("<", 256), strings.Repeat("<", 128)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const privateText = "private-response-text"
+			const privateArgument = "private-tool-argument"
+			payload, err := json.Marshal(map[string]any{
+				"type":            tc.eventType,
+				"sequence_number": 1,
+				"delta":           privateText,
+				"arguments":       `{"value":"` + privateArgument + `"}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := "event: response.created\n" +
+				`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_unknown","created_at":1700000003,"status":"in_progress"}}` + "\n\n" +
+				"data: " + string(payload) + "\n\n"
+			var logs bytes.Buffer
+			stream, err := prepareResponsesChatStream(t.Context(), io.NopCloser(strings.NewReader(fixture)), responsesChatStreamConfig{
+				PublicModel:      "gpt-public",
+				PrecommitTimeout: time.Second,
+				Carrier:          carrierEmit{Log: logger.NewWithWriter(logger.LevelInfo, &logs)},
+			})
+			if err == nil {
+				// Large events cross the precommit byte limit before their type is known.
+				err = consumeChatStreamEvents(stream, nil, nil)
+			}
+			var executionErr *chatExecutionError
+			if !errors.As(err, &executionErr) {
+				t.Fatalf("error type = %T, want *chatExecutionError", err)
+			}
+			if executionErr.Code != "unsupported_responses_event" || executionErr.StatusCode != http.StatusBadGateway {
+				t.Errorf("error code/status = %s/%d, want unsupported_responses_event/502", executionErr.Code, executionErr.StatusCode)
+			}
+			if executionErr.Message != fmt.Sprintf("upstream Responses event %q is not supported", tc.eventType) {
+				t.Error("error message did not preserve the original event type")
+			}
+
+			if logs.Len() > 1024 {
+				t.Errorf("warning size = %d bytes, want at most 1024", logs.Len())
+			}
+			for _, privateValue := range []string{privateText, privateArgument} {
+				if strings.Contains(logs.String(), privateValue) {
+					t.Errorf("warning contains private payload value %q", privateValue)
+				}
+			}
+			var entry struct {
+				Level       string          `json:"level"`
+				Message     string          `json:"msg"`
+				EventType   string          `json:"event_type"`
+				DataBytes   int             `json:"data_bytes"`
+				DataPreview json.RawMessage `json:"data_preview"`
+			}
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+				t.Fatalf("decode warning: %v", err)
+			}
+			if entry.Level != "warn" || entry.Message != "unhandled upstream Responses event" {
+				t.Error("unknown event warning is missing")
+			}
+			if entry.EventType != tc.wantLoggedType {
+				t.Errorf("logged event type differs from expected prefix: got %d bytes, want %d", len(entry.EventType), len(tc.wantLoggedType))
+			}
+			if entry.DataBytes != len(payload) {
+				t.Errorf("data_bytes = %d, want %d", entry.DataBytes, len(payload))
+			}
+			if entry.DataPreview != nil {
+				t.Error("warning contains data_preview")
+			}
+		})
+	}
+}
+
+// TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents: Copilot
+// emits `event: keepalive` during long generations; the case arm drops
+// it and lets the surrounding text still assemble.
+func TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents(t *testing.T) {
+	fixture := []byte("event: response.created\n" +
+		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ka","created_at":1700000003,"status":"in_progress"}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"in_progress","role":"assistant","content":[]}}` + "\n\n" +
+		"event: response.content_part.added\n" +
+		`data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":3}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_ka","output_index":0,"content_index":0,"delta":"hello"}` + "\n\n" +
+		"event: keepalive\n" +
+		`data: {"type":"keepalive","sequence_number":5}` + "\n\n" +
+		"event: response.output_text.done\n" +
+		`data: {"type":"response.output_text.done","sequence_number":6,"item_id":"msg_ka","output_index":0,"content_index":0,"text":"hello"}` + "\n\n" +
+		"event: response.content_part.done\n" +
+		`data: {"type":"response.content_part.done","sequence_number":7,"item_id":"msg_ka","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","sequence_number":8,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_ka","created_at":1700000003,"status":"completed","output":[{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}` + "\n\n")
+	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("prepareResponsesChatStream returned error: %v", err)
+	}
+	chunks := collectResponsesChatStreamChunks(t, stream)
+	var text string
+	for _, chunk := range chunks {
+		if len(chunk.Choices) == 0 || len(chunk.Choices[0].Delta.Content) == 0 {
+			continue
+		}
+		text += streamChunkText(t, chunk)
+	}
+	if text != "hello" {
+		t.Fatalf("assembled text = %q, want %q", text, "hello")
 	}
 }
 
