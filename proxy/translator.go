@@ -374,7 +374,7 @@ func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCache
 			})
 
 		case "tool_result":
-			toolContent, err := extractToolResultContent(block.Content)
+			toolContent, images, err := extractToolResultContent(block.Content)
 			if err != nil {
 				return nil, fmt.Errorf("extracting tool_result content: %w", err)
 			}
@@ -388,6 +388,25 @@ func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCache
 				toolMessage.CopilotCacheControl = block.CacheControl
 			}
 			result = append(result, toolMessage)
+
+			// Chat Completions rejects `image_url` parts inside `tool`
+			// messages, so any image(s) that came back as tool_result
+			// blocks are re-injected as a follow-up `user` message that
+			// references the same tool_use_id in a small text preamble.
+			// The model still sees the tool_call_id → tool → user order,
+			// so vision-capable models can act on the image while the
+			// tool_use / tool_result correlation stays intact.
+			if len(images) > 0 {
+				preamble := fmt.Sprintf("Image content from tool_use %s:", block.ToolUseID)
+				parts := make([]models.OpenAIContentPart, 0, len(images)+1)
+				parts = append(parts, models.OpenAIContentPart{Type: "text", Text: &preamble})
+				parts = append(parts, images...)
+				partsJSON, _ := json.Marshal(parts)
+				result = append(result, models.OpenAIMessage{
+					Role:    "user",
+					Content: partsJSON,
+				})
+			}
 
 		case "thinking", "redacted_thinking":
 			// skip thinking blocks
@@ -481,31 +500,49 @@ func translateAnthropicImageBlock(block models.ContentBlock) (*models.OpenAICont
 	}
 }
 
-func extractToolResultContent(raw json.RawMessage) (string, error) {
+// extractToolResultContent lowers an Anthropic tool_result content payload
+// into (a) the plain text that lands in the OpenAI `tool` message and
+// (b) any image content blocks that need to be re-injected as a follow-up
+// `user` message. The Chat Completions API does not accept `image_url`
+// parts inside `tool`-role messages — images belong to user messages — so
+// we split them out here. The tool_use_id chain to the preceding
+// assistant tool_use is preserved because the `tool` message still carries
+// the same `tool_call_id`; the follow-up user message simply attaches the
+// image(s). This is the same pattern LangChain and litellm use.
+func extractToolResultContent(raw json.RawMessage) (string, []models.OpenAIContentPart, error) {
 	if len(raw) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 
 	// Try string
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return s, nil, nil
 	}
 
 	// Try []ContentBlock
 	var blocks []models.ContentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return "", fmt.Errorf("tool_result content is neither string nor []ContentBlock: %w", err)
+		return "", nil, fmt.Errorf("tool_result content is neither string nor []ContentBlock: %w", err)
 	}
 
 	var sb strings.Builder
+	var images []models.OpenAIContentPart
 	for _, b := range blocks {
-		if b.Type != "text" {
-			return "", fmt.Errorf("unsupported tool_result content block type %q on Chat translation", b.Type)
+		switch b.Type {
+		case "text":
+			sb.WriteString(derefString(b.Text))
+		case "image":
+			part, err := translateAnthropicImageBlock(b)
+			if err != nil {
+				return "", nil, fmt.Errorf("translating tool_result image block: %w", err)
+			}
+			images = append(images, *part)
+		default:
+			return "", nil, fmt.Errorf("unsupported tool_result content block type %q on Chat translation", b.Type)
 		}
-		sb.WriteString(derefString(b.Text))
 	}
-	return sb.String(), nil
+	return sb.String(), images, nil
 }
 
 type anthropicChatCacheControlContextKey struct{}

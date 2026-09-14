@@ -125,16 +125,48 @@ func TestHandleAnthropicNativeCountTokensKeepsAccessChecksAndStripsCarriers(t *t
 	}
 }
 
-func TestAnthropicToolResultImagesFailBeforeChatDispatch(t *testing.T) {
-	for _, content := range []string{
-		`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]`,
-		`[{"type":"text","text":"screen capture"},{"type":"image","source":{"type":"url","url":"https://example.test/screen.png"}}]`,
+func TestAnthropicToolResultImagesLoweredToUserMessage(t *testing.T) {
+	// Chat Completions rejects `image_url` parts inside `tool`-role
+	// messages. Anthropic tool_result blocks CAN carry images, so the
+	// translator must split them: emit the text (if any) as the `tool`
+	// message content, then append a follow-up `user` message that
+	// carries the image(s). See translator.go extractToolResultContent
+	// and the "tool_result" branch that appends the follow-up user
+	// message. This test asserts both the shape of that follow-up and
+	// that no BadRequest is returned for the previously-rejected case.
+	for _, tc := range []struct {
+		name        string
+		content     string
+		wantText    string   // expected content of the tool message
+		wantImgURLs []string // expected image_url parts in the follow-up user message, in order
+	}{
+		{
+			name:        "image only",
+			content:     `[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]`,
+			wantText:    "",
+			wantImgURLs: []string{"data:image/png;base64,aW1hZ2U="},
+		},
+		{
+			name:        "text and image",
+			content:     `[{"type":"text","text":"screen capture"},{"type":"image","source":{"type":"url","url":"https://example.test/screen.png"}}]`,
+			wantText:    "screen capture",
+			wantImgURLs: []string{"https://example.test/screen.png"},
+		},
 	} {
 		for _, count := range []bool{false, true} {
-			t.Run(content+map[bool]string{true: " count", false: " messages"}[count], func(t *testing.T) {
-				var calls atomic.Int32
-				h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusNoContent) })
-				body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_image","name":"capture","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_image","content":` + content + `}]}]}`
+			label := tc.name + map[bool]string{true: " count", false: " messages"}[count]
+			t.Run(label, func(t *testing.T) {
+				seen := make(chan models.OpenAIRequest, 1)
+				h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+					var request models.OpenAIRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					seen <- request
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				})
+				body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_image","name":"capture","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_image","content":` + tc.content + `}]}]}`
 				recorder := httptest.NewRecorder()
 				req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body))
 				if count {
@@ -142,11 +174,81 @@ func TestAnthropicToolResultImagesFailBeforeChatDispatch(t *testing.T) {
 				} else {
 					h.HandleAnthropicMessages(recorder, req)
 				}
-				if recorder.Code != http.StatusBadRequest || calls.Load() != 0 || !strings.Contains(recorder.Body.String(), "unsupported tool_result content block") {
-					t.Fatalf("status/calls = %d/%d: %s", recorder.Code, calls.Load(), recorder.Body.String())
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+				}
+				var got models.OpenAIRequest
+				select {
+				case got = <-seen:
+				default:
+					t.Fatal("request was not forwarded")
+				}
+				// Expected 3 messages: assistant tool_use, tool, follow-up user with image(s).
+				if len(got.Messages) != 3 {
+					t.Fatalf("message count = %d: %+v", len(got.Messages), got.Messages)
+				}
+				if got.Messages[0].Role != "assistant" {
+					t.Fatalf("msg[0].role = %q, want assistant", got.Messages[0].Role)
+				}
+				toolMsg := got.Messages[1]
+				if toolMsg.Role != "tool" || toolMsg.ToolCallID != "call_image" {
+					t.Fatalf("msg[1] = %+v, want role=tool tool_call_id=call_image", toolMsg)
+				}
+				var gotToolText string
+				if err := json.Unmarshal(toolMsg.Content, &gotToolText); err != nil {
+					t.Fatalf("tool msg content not a JSON string: %s (%v)", string(toolMsg.Content), err)
+				}
+				if gotToolText != tc.wantText {
+					t.Fatalf("tool msg text = %q, want %q", gotToolText, tc.wantText)
+				}
+				userMsg := got.Messages[2]
+				if userMsg.Role != "user" {
+					t.Fatalf("msg[2].role = %q, want user", userMsg.Role)
+				}
+				var parts []models.OpenAIContentPart
+				if err := json.Unmarshal(userMsg.Content, &parts); err != nil {
+					t.Fatalf("follow-up user content not a JSON array: %s (%v)", string(userMsg.Content), err)
+				}
+				// parts[0] is the text preamble that names the tool_use id; the
+				// remaining parts must be image_url in order.
+				if len(parts) != 1+len(tc.wantImgURLs) {
+					t.Fatalf("follow-up parts count = %d, want %d: %+v", len(parts), 1+len(tc.wantImgURLs), parts)
+				}
+				if parts[0].Type != "text" || parts[0].Text == nil || !strings.Contains(*parts[0].Text, "call_image") {
+					t.Fatalf("follow-up preamble = %+v; want text mentioning tool_use_id", parts[0])
+				}
+				for i, wantURL := range tc.wantImgURLs {
+					p := parts[1+i]
+					if p.Type != "image_url" || p.ImageURL == nil || p.ImageURL.URL != wantURL {
+						t.Fatalf("follow-up img[%d] = %+v, want image_url=%s", i, p, wantURL)
+					}
 				}
 			})
 		}
+	}
+}
+
+func TestAnthropicToolResultRejectsUnknownContentBlock(t *testing.T) {
+	// Belt-and-braces: types we can neither carry as text nor lower to
+	// an image (e.g. an audio content block, or a typo like "imag") must
+	// still return 400 before the upstream sees the request. Guards
+	// against silently dropping content the model was expected to see.
+	for _, count := range []bool{false, true} {
+		t.Run(map[bool]string{true: "count", false: "messages"}[count], func(t *testing.T) {
+			var calls atomic.Int32
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusNoContent) })
+			body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_audio","name":"cap","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_audio","content":[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"eg=="}}]}]}]}`
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body))
+			if count {
+				h.HandleAnthropicMessagesCountTokens(recorder, req)
+			} else {
+				h.HandleAnthropicMessages(recorder, req)
+			}
+			if recorder.Code != http.StatusBadRequest || calls.Load() != 0 || !strings.Contains(recorder.Body.String(), "unsupported tool_result content block") {
+				t.Fatalf("status/calls = %d/%d: %s", recorder.Code, calls.Load(), recorder.Body.String())
+			}
+		})
 	}
 }
 
