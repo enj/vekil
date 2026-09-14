@@ -54,6 +54,7 @@ type streamLifecycleHooks struct {
 	transportCanceled      func() bool
 	suppressStats          func()
 	writePrecommitShutdown func()
+	onCopilotUsage         func(json.RawMessage)
 }
 
 func (h streamLifecycleHooks) suppressTransportCancellation(committed bool) bool {
@@ -296,7 +297,7 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 	}
 	knownTopLevel := map[string]struct{}{
 		"id": {}, "object": {}, "created": {}, "model": {}, "choices": {},
-		"system_fingerprint": {}, "service_tier": {}, "usage": {},
+		"system_fingerprint": {}, "service_tier": {}, "usage": {}, "copilot_usage": {},
 	}
 	for key, value := range raw {
 		if _, known := knownTopLevel[key]; !known && !rawJSONIsNullOrEmpty(value) {
@@ -306,6 +307,9 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 	if usage, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
 		// A usage frame proves the attempt reached provider-side accounting. Even an
 		// otherwise empty usage-only chunk is therefore beyond a replay-safe preamble.
+		return upstreamProgressTerminalSuccess
+	}
+	if usage, ok := raw["copilot_usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
 		return upstreamProgressTerminalSuccess
 	}
 
@@ -392,7 +396,7 @@ func rawJSONHasSemanticValue(raw json.RawMessage) bool {
 	return true
 }
 
-func inspectAnthropicStreamEvent(eventType, data string) explicitRouteStreamInspection {
+func inspectAnthropicStreamEvent(eventType, data string, requireMessageStop bool) explicitRouteStreamInspection {
 	data = strings.TrimSpace(data)
 	if data == "" {
 		return explicitRouteStreamInspection{progress: upstreamProgressAllowedPreamble}
@@ -434,7 +438,12 @@ func inspectAnthropicStreamEvent(eventType, data string) explicitRouteStreamInsp
 		default:
 			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
 		}
-	case "content_block_stop", "message_delta", "message_stop":
+	case "content_block_stop", "message_delta":
+		if requireMessageStop {
+			return explicitRouteStreamInspection{progress: upstreamProgressSemanticOutput}
+		}
+		fallthrough
+	case "message_stop":
 		return explicitRouteStreamInspection{progress: upstreamProgressTerminalSuccess, terminalSuccess: true}
 	case "error":
 		status, ok := anthropicStreamErrorStatus([]byte(data))
@@ -694,7 +703,7 @@ func runExplicitRouteStreamPeekPump(body io.ReadCloser, pw *io.PipeWriter, proto
 		var result explicitRouteStreamInspection
 		switch protocol {
 		case explicitRouteStreamAnthropic:
-			result = inspectAnthropicStreamEvent(eventType, data)
+			result = inspectAnthropicStreamEvent(eventType, data, false)
 		default:
 			result = inspectOpenAIChatStreamEvent(eventType, data)
 		}
@@ -1043,7 +1052,7 @@ func streamOpenAIPassthrough(
 				transformedCurrentData = &data
 			}
 		}
-		if !dropInjectedUsage && onUsage == nil && aggregator == nil {
+		if !dropInjectedUsage && onUsage == nil && aggregator == nil && lifecycle.onCopilotUsage == nil {
 			return true
 		}
 
@@ -1051,12 +1060,27 @@ func streamOpenAIPassthrough(
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
+		if lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			lifecycle.onCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil {
 			if onUsage != nil {
 				onUsage(chunk.Usage)
 			}
 			if dropInjectedUsage && len(chunk.Choices) == 0 {
-				dropCurrent = true
+				if rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+					dropCurrent = true
+				} else {
+					// Standard usage may be injected for local accounting, but a
+					// shared frame can also carry upstream billing metadata.
+					var payload map[string]json.RawMessage
+					if json.Unmarshal([]byte(data), &payload) == nil {
+						delete(payload, "usage")
+						encoded, _ := json.Marshal(payload)
+						transformed := string(encoded)
+						transformedCurrentData = &transformed
+					}
+				}
 			}
 		}
 		if aggregator != nil {
@@ -1280,7 +1304,10 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	if len(lifecycleHooks) > 0 {
 		lifecycle = lifecycleHooks[0]
 	}
-	markFailure := func(data []byte) {
+	observeData := func(data []byte) {
+		if raw := usage.observe(data); lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(raw) {
+			lifecycle.onCopilotUsage(raw)
+		}
 		if status, ok := anthropicStreamErrorStatus(data); ok {
 			observeResponseFailureStatus(ctx, status)
 		}
@@ -1293,7 +1320,7 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		// No model rewrite: preserve the original byte-exact, unbounded passthrough
 		// (io.Copy handles SSE lines of any size) while teeing the bytes through a
 		// best-effort usage/error sniffer. The sniffer skips lines it cannot buffer.
-		sniffer := newAnthropicUsageSniffWriter(usage, markFailure)
+		sniffer := newAnthropicUsageSniffWriter(observeData)
 		fw := &flushWriter{w: w, flusher: flusher}
 		handleLifecycleCancellation := func() bool {
 			if lifecycle.transportCanceled == nil || !lifecycle.transportCanceled() {
@@ -1351,8 +1378,7 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			content, _ := splitSSELineEnding(line)
 			if data, ok := parseSSELine(content); ok {
 				dataBytes := []byte(data)
-				usage.observe(dataBytes)
-				markFailure(dataBytes)
+				observeData(dataBytes)
 				if anthropicStreamDataIsMessageStop(dataBytes) {
 					sawTerminalEvent = true
 				} else if _, ok := anthropicStreamErrorStatus(dataBytes); ok {
@@ -1424,12 +1450,10 @@ func anthropicStreamDataIsMessageStop(data []byte) bool {
 
 // anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage (and
 // error frames) as it is copied to the client. It buffers a single SSE line at a
-// time and, on each complete data line, feeds the payload to the accumulator and
-// the optional onData callback (used to detect error frames). A line longer than
-// the buffer cap is skipped so the sniffer never affects the client copy or grows
-// unbounded.
+// time and, on each complete data line, feeds the payload to the onData callback.
+// A line longer than the buffer cap is skipped so the sniffer never affects the
+// client copy or grows unbounded.
 type anthropicUsageSniffWriter struct {
-	acc               *anthropicStreamUsageAccumulator
 	onData            func([]byte)
 	line              []byte
 	tail              []byte
@@ -1441,9 +1465,8 @@ type anthropicUsageSniffWriter struct {
 	sawTerminalEvent  bool
 }
 
-func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator, onData func([]byte)) *anthropicUsageSniffWriter {
+func newAnthropicUsageSniffWriter(onData func([]byte)) *anthropicUsageSniffWriter {
 	return &anthropicUsageSniffWriter{
-		acc:    acc,
 		onData: onData,
 		line:   make([]byte, 0, 512),
 		tail:   make([]byte, 0, 4),
@@ -1464,7 +1487,6 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 			if !s.overflow {
 				if data, ok := parseSSELine(lineContent); ok {
 					dataBytes := []byte(data)
-					s.acc.observe(dataBytes)
 					if s.onData != nil {
 						s.onData(dataBytes)
 					}
@@ -1633,6 +1655,9 @@ func streamOpenAIToAnthropicWithLifecycle(
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
 
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			lifecycle.onCopilotUsage(chunk.CopilotUsage)
+		}
 		if onUsage != nil && chunk.Usage != nil {
 			onUsage(chunk.Usage)
 		}
@@ -2116,6 +2141,9 @@ func (a *openAIResponseAggregator) addChunk(chunk models.OpenAIStreamChunk) {
 	}
 	if chunk.Usage != nil {
 		a.response.Usage = chunk.Usage
+	}
+	if !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+		a.response.CopilotUsage = bytes.Clone(chunk.CopilotUsage)
 	}
 
 	for _, choice := range chunk.Choices {

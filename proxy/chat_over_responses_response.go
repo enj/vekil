@@ -45,8 +45,9 @@ type responsesChatJSONEnvelope struct {
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
-	Output []json.RawMessage `json:"output"`
-	Usage  *responsesUsage   `json:"usage"`
+	Output       []json.RawMessage `json:"output"`
+	Usage        *responsesUsage   `json:"usage"`
+	CopilotUsage json.RawMessage   `json:"copilot_usage"`
 }
 
 func translateResponsesJSONToChat(body []byte, options responsesChatResponseOptions) (result responsesChatJSONResult, err error) {
@@ -204,6 +205,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 		}},
 	}
 	response.Usage = usage
+	response.CopilotUsage = envelope.CopilotUsage
 	normalizeOpenAIChatCompletionStruct(response, options.PublicModel)
 	encoded, err := json.Marshal(response)
 	if err != nil {
@@ -454,7 +456,8 @@ func responsesChatFailedExecutionError(failure *struct {
 
 func responsesChatErrorTypeForCode(code string) string {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error",
+		"user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
 		return "rate_limit_error"
 	case "invalid_prompt", "bio_policy", "invalid_image", "invalid_image_format", "invalid_base64_image", "invalid_image_url",
 		"image_too_large", "image_too_small", "image_parse_error", "image_content_policy_violation", "invalid_image_mode",
@@ -467,7 +470,8 @@ func responsesChatErrorTypeForCode(code string) string {
 
 func responsesChatFailureStatus(errorType, code string) int {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error",
+		"user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
 		return http.StatusTooManyRequests
 	case "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
 		return http.StatusServiceUnavailable

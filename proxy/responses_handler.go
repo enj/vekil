@@ -262,6 +262,7 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	bodyBytes, pooledBody, err := readBodyBorrowedWithLimit(r, maxLargeRequestBodySize)
 	if pooledBody != nil {
 		defer releaseSmallRequestBodyBuffer(pooledBody)
@@ -717,8 +718,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), true)
 	defer upstreamCancel()
+	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, r.Header)
 	model := rawJSONString(body["model"])
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointResponses)
@@ -843,8 +845,10 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	reqBody, _ := json.Marshal(responsesReq)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
+	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, r.Header)
+	upstreamCtx = withTaskInferenceKind(upstreamCtx, taskMemory)
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), memReq.Model, providerEndpointResponses)
@@ -1529,6 +1533,8 @@ func (h *ProxyHandler) compactLearnedTargetKeyForRequest(requestFields map[strin
 }
 
 func (h *ProxyHandler) compactResponsesRequestWithBudget(ctx context.Context, requestFields map[string]json.RawMessage, extraHeaders http.Header, budget *compactBudget) (string, *http.Response, error) {
+	ctx = withTaskInferenceKind(ctx, taskCompaction)
+	ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, (*responsesNativeRequest)(nil))
 	normalizedFields, removedFields := normalizeCompactionRequestFields(requestFields)
 	requestFields = normalizedFields
 	if len(removedFields) > 0 {
@@ -3217,6 +3223,8 @@ func (h *ProxyHandler) postResponsesWithFallbackHeadersTracked(ctx context.Conte
 // compact calls in the same fanout pre-rewrite their body via
 // applyResolvedCompactModel and skip the unsupported-model probe entirely.
 func (h *ProxyHandler) postResponsesCompactWithFallback(ctx context.Context, bodyBytes []byte, extraHeaders http.Header, budget *compactBudget) (*http.Response, error) {
+	ctx = withTaskInferenceKind(ctx, taskCompaction)
+	ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, (*responsesNativeRequest)(nil))
 	resp, fallbackModel, err := h.postResponsesWithFallbackHeadersTracked(withRouteAttemptKind(ctx, routeAttemptCompaction), bodyBytes, extraHeaders)
 	if err != nil {
 		return nil, err

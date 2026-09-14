@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -430,10 +431,15 @@ func (s *responsesChatStreamState) finishChunk(reason string) models.OpenAIStrea
 	return chunk
 }
 
-func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage) models.OpenAIStreamChunk {
+func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage, copilotUsage json.RawMessage) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{}
 	chunk.Usage = usage
+	if !rawJSONIsNullOrEmpty(copilotUsage) {
+		payload := map[string]json.RawMessage{"copilot_usage": copilotUsage}
+		rewriteOpenAIChatCompletionModelIdentity(payload, s.config.PublicModel)
+		chunk.CopilotUsage = payload["copilot_usage"]
+	}
 	return chunk
 }
 
@@ -487,9 +493,19 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	if s.hasSequence && header.SequenceNumber != s.sequence+1 {
-		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses stream sequence is not contiguous")
-	}
+	// WORKAROUND: a gap in sequence_number no longer fails the turn.
+	//
+	// This check alone accounted for every failure in an 11-hour session against a
+	// degraded Copilot: each 15-25 minute turn ended in `502 Responses stream
+	// sequence is not contiguous`, and the work was lost. sequence_number is
+	// tracked here and read nowhere -- nothing orders, dedupes or reassembles by
+	// it -- so tolerating a gap costs nothing downstream, while failing closed
+	// converts a degraded-but-usable stream into a dead turn. The structural
+	// checks that do protect the translation (content-part transitions, item
+	// correlation, terminal events) are deliberately untouched.
+	//
+	// Restore strictness by reinstating the returned error below; the check came
+	// from a569bee (#268), not from the reasoning-carrier work.
 	s.hasSequence = true
 	s.sequence = header.SequenceNumber
 
@@ -537,7 +553,22 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_text.delta",
 		"response.reasoning_text.done":
 		return s.handleReasoningProgress(eventType, []byte(msg.data))
+	case "keepalive":
+		// Copilot Responses upstream emits during long generations; no state carried, drop.
+		return responsesChatStreamTransition{}, nil
 	default:
+		// Log bounded metadata so new event types are diagnosable without exposing payloads.
+		if s.config.Carrier.Log != nil {
+			const maxLoggedEventTypeBytes = 128
+			loggedEventType := eventType
+			if len(loggedEventType) > maxLoggedEventTypeBytes {
+				loggedEventType = strings.ToValidUTF8(loggedEventType[:maxLoggedEventTypeBytes], "")
+			}
+			s.config.Carrier.Log.Warn("unhandled upstream Responses event",
+				logger.F("event_type", loggedEventType),
+				logger.F("data_bytes", len(msg.data)),
+			)
+		}
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
 	}
 }
@@ -1009,16 +1040,23 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.completed arrived before response.created")
 	}
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if unmarshalErr := json.Unmarshal(data, &event); unmarshalErr != nil {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal Responses event is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var terminalUsage *models.OpenAIUsage
 	usageFailureTransition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		terminalUsage = event.Response.Usage.toOpenAIUsage()
-		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage)}
+	}
+	if terminalUsage != nil || !rawJSONIsNullOrEmpty(billing) {
+		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage, billing)}
 	}
 	defer func() {
 		if err == nil {
@@ -1182,12 +1220,9 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	}
 
 	chunks = append(chunks, s.finishChunk(finishReason))
-	if terminalUsage != nil {
-		// Canonical event streams always carry terminal usage for aggregation and
-		// accounting. The OpenAI public adapter drops this chunk unless the original
-		// client requested stream_options.include_usage; Anthropic/Gemini consume it internally.
-		chunks = append(chunks, s.usageChunk(terminalUsage))
-	}
+	// Canonical streams carry terminal token usage and billing for aggregation and
+	// accounting. Public adapters decide which fields to expose.
+	chunks = append(chunks, usageFailureTransition.chunks...)
 	s.terminalSeen = true
 	transition.chunks = chunks
 	transition.terminal = true
@@ -1252,16 +1287,23 @@ func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
 
 func (s *responsesChatStreamState) handleFailed(data []byte) (responsesChatStreamTransition, error) {
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil || event.Response.Status != "failed" {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.failed is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var usage *models.OpenAIUsage
 	transition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		usage = event.Response.Usage.toOpenAIUsage()
-		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage)}
+	}
+	if usage != nil || !rawJSONIsNullOrEmpty(billing) {
+		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage, billing)}
 	}
 	s.terminalSeen = true
 	return transition, responsesChatFailedExecutionError(event.Response.Error, usage)

@@ -67,6 +67,7 @@ type RequestSummary struct {
 	totalTokensValue          int
 	cachedTokensValue         int
 	reasoningTokensValue      int
+	copilotUsage              copilotUsageTotals
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -547,10 +548,11 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 		s.cachedTokensValue = usage.PromptTokensDetails.CachedTokens
 		s.cachedTokens = &s.cachedTokensValue
 	}
-	if usage.CompletionTokensDetails != nil {
+	s.reasoningTokensValue = usage.ReasoningTokens
+	if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
 		s.reasoningTokensValue = usage.CompletionTokensDetails.ReasoningTokens
-		s.reasoningTokens = &s.reasoningTokensValue
 	}
+	s.reasoningTokens = &s.reasoningTokensValue
 }
 
 func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {
@@ -723,6 +725,18 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	}
 	if s.totalTokens != nil {
 		fields = append(fields, logger.F("total_tokens", *s.totalTokens))
+	}
+	if s.cachedTokens != nil {
+		fields = append(fields, logger.F("cached_tokens", *s.cachedTokens))
+	}
+	if s.reasoningTokens != nil {
+		fields = append(fields, logger.F("reasoning_tokens", *s.reasoningTokens))
+	}
+	if s.copilotUsage.TotalNanoAIU > 0 {
+		fields = append(fields, logger.F("total_nano_aiu", s.copilotUsage.TotalNanoAIU))
+	}
+	if s.copilotUsage.ComputeUnits > 0 {
+		fields = append(fields, logger.F("compute_units", s.copilotUsage.ComputeUnits))
 	}
 	if s.statsSuppressed {
 		fields = append(fields, logger.F("stats_suppressed", true))

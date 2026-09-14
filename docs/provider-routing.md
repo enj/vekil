@@ -238,7 +238,12 @@ An OpenAI-family route may use Copilot, Azure, or static OpenAI-compatible targe
 
 Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes and the classifier route must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier; opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
 
-The optional websocket bridge is still transport adaptation over HTTP `/responses`. Its first provider-backed `response.create` may use the same safe precommit route failover; after a successful target is exposed, the session is pinned to that exact route/target and later turns fail closed rather than migrate. See [Responses WebSocket Bridge](responses-websocket.md).
+The optional websocket bridge uses upstream HTTP `/responses` by default. Its
+first provider-backed `response.create` may use the same safe precommit route
+failover; after a successful target is exposed, the session is pinned to that
+exact route/target. Experimental native Copilot connections additionally
+prohibit retry or migration after sending a create. See
+[Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
 
@@ -248,9 +253,14 @@ There is one narrow first-use exception for a client-supplied Responses `convers
 
 The binding index is bounded to 262,144 entries with a 24-hour absolute TTL and is process-local. Capacity eviction, expiry, restart, or sending the next request to another Vekil process makes a prior binding unknown. For ordinary provider state that fails closed. A conversation-only request on a currently deterministic route can instead take the bootstrap path, which cannot distinguish genuine first use from a lost prior binding; keep the process affinity and deterministic target stable for the lifetime of active conversations. Lookups update recency for eviction but do not extend the absolute TTL; observing the same token again from the same owner refreshes it. **Every explicit Responses route that accepts provider-issued state requires one Vekil process or sticky ingress to the process that owns the binding**, including one-target and `primary_only` routes. Responses-backed Chat tool continuations use a separate process-local replay store and have the same affinity/restart constraint. Vekil does not migrate Responses state, replay a WebSocket session onto another target, or infer portability from user-provided strings. Durable/shared bindings and proxy-signed target hints are future work.
 
-### No terminal-route balancing or circuit breaker
+### No terminal-route balancing or generic circuit breaker
 
-Schema version 2 deliberately does not include active-active/weighted routing, automatic affinity extraction, bounded-load selection, active health probes, user-defined quota/cache/failure domains, half-open terminal-target circuit-breaker state, configured cross-model fallback, or cross-route fallback. Temporary target errors also do not change `/readyz`. Any future exact-target cooldown based on authoritative `Retry-After` data requires separate implementation; no generic circuit-breaker framework is implied by `priority_failover`.
+Schema version 2 does not include weighted routing, active health probes,
+user-defined quota domains, generic terminal-target circuit breakers, or
+cross-route fallback. Temporary target errors do not change `/readyz`.
+Recognized Copilot throttles with authoritative reset data use the separate
+[shared cooldown controller](troubleshooting.md). Priority failover may select
+an unaffected target when the request has no binding that prevents a switch.
 
 Schema-v2 policy routing adds a separate infrastructure-only breaker for the **classifier route**, not for terminal target selection. Only pre-inference transport failures, `429`, and upstream `5xx` affect it. Timeouts, malformed classifier output, missing forced calls, abstention, content-dependent latency, and user validation errors do not change shared health. A selected terminal route still follows only its own configured `primary_only` or replay-safe `priority_failover` behavior; classifier failure selects the profile's configured unavailable tier and never creates cross-tier failover.
 

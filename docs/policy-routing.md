@@ -323,7 +323,7 @@ Defaults:
 
 - open after five consecutive infrastructure failures;
 - 30-second cooldown;
-- an authoritative `429 Retry-After` opens immediately, capped at 60 seconds;
+- an authoritative `429 Retry-After` opens immediately and prevents probes until that reset, including long decimal and HTTP-date resets;
 - one half-open probe; and
 - any successful classifier HTTP exchange closes the breaker, even if its semantic payload is uncertain.
 

@@ -1994,6 +1994,9 @@ func statsTokenUsageFromOpenAI(usage *models.OpenAIUsage) (statsTokenUsage, bool
 	if usage.CompletionTokensDetails != nil {
 		out.ReasoningTokens = int64(usage.CompletionTokensDetails.ReasoningTokens)
 	}
+	if out.ReasoningTokens <= 0 {
+		out.ReasoningTokens = int64(usage.ReasoningTokens)
+	}
 	return out.normalized(), true
 }
 
@@ -2031,39 +2034,46 @@ func routeAttemptDiagnosticHeaders(headers http.Header) http.Header {
 			out.Set(name, boundStatLabelRunes(value, statOperationalLabelMaxLen))
 		}
 	}
+	copyCopilotDiagnosticHeaders(out, headers)
 	return out
 }
 
 type routeAttemptResponseObserver struct {
 	mu sync.Mutex
 
-	record          *routeAttemptRecord
-	operation       *routeOperation
-	inboundCtx      context.Context
-	attemptCtx      context.Context
-	trace           routeAttemptTrace
-	send            *routeSendObservation
-	endpoint        string
-	streaming       bool
-	headers         http.Header
-	statusCode      int
-	outcome         routeAttemptOutcome
-	progress        upstreamSemanticProgress
-	commitment      downstreamCommitment
-	decision        routeRetryDecision
-	retryAfter      *int64
-	upstreamID      string
-	usage           statsTokenUsage
-	haveUsage       bool
-	terminal        bool
-	cleanupTimedOut bool
-	line            []byte
-	lineOverflow    bool
-	linePendingCR   bool
-	sse             sseDataAccumulator
-	tail            routeAttemptTailBuffer
-	envelope        *routeAttemptEnvelopeExtractor
-	anthropic       anthropicStreamUsageAccumulator
+	record                    *routeAttemptRecord
+	operation                 *routeOperation
+	inboundCtx                context.Context
+	attemptCtx                context.Context
+	trace                     routeAttemptTrace
+	send                      *routeSendObservation
+	endpoint                  string
+	streaming                 bool
+	headers                   http.Header
+	statusCode                int
+	outcome                   routeAttemptOutcome
+	progress                  upstreamSemanticProgress
+	commitment                downstreamCommitment
+	decision                  routeRetryDecision
+	retryAfter                *int64
+	upstreamID                string
+	usage                     statsTokenUsage
+	haveUsage                 bool
+	usageOnly                 bool
+	captureCopilotUsage       bool
+	copilotUsage              copilotUsageTotals
+	acceptIncompleteResponses bool
+	requireResponsesTerminal  bool
+	requireMessageStop        bool
+	terminal                  bool
+	cleanupTimedOut           bool
+	line                      []byte
+	lineOverflow              bool
+	linePendingCR             bool
+	sse                       sseDataAccumulator
+	tail                      routeAttemptTailBuffer
+	envelope                  *routeAttemptEnvelopeExtractor
+	anthropic                 anthropicStreamUsageAccumulator
 }
 
 func newRouteAttemptResponseObserver(record *routeAttemptRecord, operation *routeOperation, trace routeAttemptTrace, send *routeSendObservation, endpoint string, streaming bool, headers http.Header) *routeAttemptResponseObserver {
@@ -2123,41 +2133,45 @@ func (o *routeAttemptResponseObserver) observe(p []byte) {
 		return
 	}
 	o.mu.Lock()
-	o.tail.append(p)
+	// Messages accounting reads parsed events and never uses the diagnostic tail.
+	if !o.usageOnly || !o.streaming || o.endpoint != providerEndpointMessages {
+		o.tail.append(p)
+	}
 	if !o.streaming {
 		o.envelope.observe(p)
 		o.mu.Unlock()
 		return
 	}
 	publish := false
-	for _, b := range p {
+	for len(p) > 0 {
 		if o.linePendingCR {
 			o.linePendingCR = false
-			if b == '\n' {
+			if p[0] == '\n' {
+				p = p[1:]
 				continue
 			}
 		}
-		switch b {
-		case '\r':
-			if o.consumeSSELineLocked() {
-				publish = true
-			}
-			o.linePendingCR = true
-		case '\n':
-			if o.consumeSSELineLocked() {
-				publish = true
-			}
-		default:
-			if o.lineOverflow {
-				continue
-			}
-			if len(o.line) >= routeAttemptObservationMaxLine {
+		end := bytes.IndexAny(p, "\r\n")
+		if end < 0 {
+			end = len(p)
+		}
+		if !o.lineOverflow {
+			if end > routeAttemptObservationMaxLine-len(o.line) {
 				o.line = nil
 				o.lineOverflow = true
-				continue
+			} else {
+				o.line = append(o.line, p[:end]...)
 			}
-			o.line = append(o.line, b)
 		}
+		p = p[end:]
+		if len(p) == 0 {
+			break
+		}
+		if o.consumeSSELineLocked() {
+			publish = true
+		}
+		o.linePendingCR = p[0] == '\r'
+		p = p[1:]
 	}
 	var completion routeAttemptCompletion
 	if publish {
@@ -2182,7 +2196,7 @@ func (o *routeAttemptResponseObserver) consumeSSELineLocked() bool {
 		o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)
 		return false
 	}
-	line := string(append(append([]byte(nil), o.line...), '\n'))
+	line := string(o.line)
 	o.line = o.line[:0]
 	publish := false
 	if !o.sse.consumeLine(line, func(eventType, data string) bool {
@@ -2217,6 +2231,12 @@ func (o *routeAttemptResponseObserver) observeOverflowedSSEEvent() bool {
 	switch eventType {
 	case "response.completed":
 		o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+	case "response.incomplete":
+		if o.acceptIncompleteResponses {
+			o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+		} else if o.applyStreamingTerminal(routeAttemptOutcomeFailed, upstreamProgressTerminalFailure) {
+			o.statusCode = http.StatusBadGateway
+		}
 	case "response.cancelled", "response.canceled":
 		o.applyStreamingTerminal(routeAttemptOutcomeCanceled, upstreamProgressTerminalFailure)
 	default:
@@ -2253,12 +2273,20 @@ func (o *routeAttemptResponseObserver) applyStreamingTerminal(outcome routeAttem
 
 func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) bool {
 	data = strings.TrimSpace(data)
+	if o.usageOnly && !taskUsageStreamEventNeedsInspection(o.endpoint, eventType, data) {
+		return false
+	}
 	switch o.endpoint {
 	case providerEndpointResponses:
 		return o.observeResponsesEvent(eventType, data)
 	case providerEndpointMessages:
-		o.anthropic.observe([]byte(data))
-		inspection := inspectAnthropicStreamEvent(eventType, data)
+		billing := o.anthropic.observe([]byte(data))
+		if o.captureCopilotUsage {
+			if usage, ok := parseCopilotUsage(billing); ok {
+				o.copilotUsage.merge(usage)
+			}
+		}
+		inspection := inspectAnthropicStreamEvent(eventType, data, o.requireMessageStop)
 		if inspection.failure != nil {
 			if !o.applyStreamingTerminal(routeAttemptOutcomeFailed, upstreamProgressTerminalFailure) {
 				return false
@@ -2275,6 +2303,11 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 		return false
 	default:
 		inspection := inspectOpenAIChatStreamEvent(eventType, data)
+		if o.captureCopilotUsage && inspection.chunk != nil {
+			if usage, ok := parseCopilotUsage(inspection.chunk.CopilotUsage); ok {
+				o.copilotUsage.merge(usage)
+			}
+		}
 		if inspection.chunk != nil && inspection.chunk.Usage != nil {
 			if usage, ok := statsTokenUsageFromOpenAI(inspection.chunk.Usage); ok {
 				o.usage = usage
@@ -2300,9 +2333,18 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 
 func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data string) bool {
 	if data == "[DONE]" {
+		if o.requireResponsesTerminal {
+			return false
+		}
 		return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
 	}
-	event, err := parseResponsesStreamEvent(data)
+	var event responsesWebSocketStreamEvent
+	err := json.Unmarshal([]byte(data), &event)
+	if o.captureCopilotUsage {
+		if usage, ok := parseCopilotUsage(event.CopilotUsage); ok {
+			o.copilotUsage.merge(usage)
+		}
+	}
 	if err != nil {
 		if !o.terminal {
 			o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)
@@ -2323,6 +2365,9 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 	case "response.cancelled", "response.canceled":
 		return o.applyStreamingTerminal(routeAttemptOutcomeCanceled, upstreamProgressTerminalFailure)
 	case "response.failed", "response.incomplete", "error":
+		if event.Type == "response.incomplete" && o.acceptIncompleteResponses {
+			return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+		}
 		failureHeaders := responsesFailureHeaders(event, o.headers)
 		status, _, ok := classifyResponsesFailure(event, failureHeaders)
 		if !ok || status == 0 {
@@ -2464,9 +2509,6 @@ func (o *routeAttemptResponseObserver) finish(cleanupComplete bool, readErr erro
 }
 
 func (o *routeAttemptResponseObserver) finishStreamingUsageLocked() {
-	if o.haveUsage {
-		return
-	}
 	if o.endpoint == providerEndpointMessages {
 		if o.anthropic.haveInput || o.anthropic.haveOutput {
 			prompt := o.anthropic.input + o.anthropic.cacheRead + o.anthropic.cacheCreation
@@ -2478,6 +2520,9 @@ func (o *routeAttemptResponseObserver) finishStreamingUsageLocked() {
 			}.normalized()
 			o.haveUsage = true
 		}
+		return
+	}
+	if o.haveUsage {
 		return
 	}
 	if o.endpoint == providerEndpointResponses {
@@ -2579,8 +2624,13 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 				o.outcome = routeAttemptOutcomeSucceeded
 				o.terminal = true
 			case "failed", "incomplete":
-				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
-				o.outcome = routeAttemptOutcomeFailed
+				if strings.EqualFold(strings.TrimSpace(status), "incomplete") && o.acceptIncompleteResponses {
+					o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalSuccess)
+					o.outcome = routeAttemptOutcomeSucceeded
+				} else {
+					o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
+					o.outcome = routeAttemptOutcomeFailed
+				}
 				o.terminal = true
 			case "cancelled", "canceled":
 				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
@@ -2970,7 +3020,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	if operation.route != route {
 		return nil, fmt.Errorf("route operation for %q cannot execute route %q", operation.route.public.id, route.public.id)
 	}
-
 	attemptNow := time.Now
 	if h != nil && h.stats != nil && h.stats.now != nil {
 		attemptNow = h.stats.now
@@ -3025,8 +3074,50 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			providerID: target.provider.id,
 		}))
 		req.GetBody = nil
+		if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			captured, _ := captureRouteResponse(rejected)
+			failure := routeAttemptFailure{response: captured, statusCode: rejected.StatusCode, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, outcome: routeAttemptOutcomeRejected, decision: routeRetrySuppressedNonretryable, cleanupDone: true}
+			failures = append(failures, failure)
+			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: failure.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+			break
+		}
+		permit, blocked, admissionErr := h.acquireCopilotInference(req)
+		if blocked != nil || admissionErr != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			decision := routeRetrySuppressedAdmission
+			failure := routeAttemptFailure{err: admissionErr, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, cleanupDone: true}
+			if blocked != nil {
+				failure.response, _ = captureRouteResponse(blocked)
+				failure.statusCode = blocked.StatusCode
+				failure.retryAfter = blocked.Header.Get("Retry-After")
+				failure.outcome = routeAttemptOutcomeRejected
+				if !operation.allowsAutomaticTargetSwitch(kind) {
+					decision = routeRetrySuppressedState
+				} else if route.policy.mode == routeModePriorityFailover && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) {
+					decision = routeRetrySwitchTarget
+				}
+			} else if ctx.Err() != nil || h.ShuttingDown() {
+				decision = routeRetrySuppressedLifecycle
+			}
+			failure.decision = decision
+			failures = append(failures, failure)
+			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: failure.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: decision, CleanupDone: true})
+			if decision == routeRetrySwitchTarget {
+				continue
+			}
+			break
+		}
 
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
+			permit.release()
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
 			message := "route upstream-send budget exhausted"
 			switch decision {
 			case routeRetrySuppressedAdmission:
@@ -3059,6 +3150,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 
 		resp, sendErr := h.singleInferenceSend(req, observation)
+		h.finishCopilotInference(req, resp, sendErr, permit)
 		if resp != nil {
 			sanitizeExplicitRouteResponseHeaders(resp.Header)
 		}
@@ -3287,19 +3379,28 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	if client == nil {
 		client = http.DefaultClient
 	}
-	clone := *client
-	clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
+	resp, handled, err := h.maybeSendNativeResponses(req)
+	var receipt *taskInferenceSend
+	if !handled {
+		clone := *client
+		clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		if req.URL != nil && req.RequestURI == "" {
+			receipt = h.beginTaskInferenceSend(req)
+		}
+		resp, err = clone.Do(req)
 	}
-	resp, err := clone.Do(req)
 	if resp == nil || resp.Body == nil {
 		owner.cancelRequest()
+		receipt.finish(resp, err)
 		return resp, err
 	}
 	if resp.Request == nil {
 		resp.Request = req
 	}
 	maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
+	receipt.finish(resp, err)
 	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation}
 	return resp, err
 }
@@ -3433,6 +3534,10 @@ func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWeb
 	switch code {
 	case "too_many_requests", "rate_limit_exceeded":
 		return http.StatusTooManyRequests, true
+	case "user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
+		if target.provider.kind == providerTypeCopilot {
+			return http.StatusTooManyRequests, true
+		}
 	case "model_overloaded", "engine_overloaded", "server_overloaded":
 		if target.provider.kind == providerTypeCopilot || target.provider.kind == providerTypeAzureOpenAI || target.provider.kind == providerTypeOpenAICompatible {
 			return http.StatusServiceUnavailable, true
@@ -3475,6 +3580,9 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 	transportOwner := routeAttemptTransportOwnership(resp.Body)
 	prepared := newResponsesPreparedStreamWithPolicy(resp, responsesPrecommitMaxPeekBytes, true, true)
 	result, hasResult, awaitSource, err := prepared.await(operation.inbound, ctx, responsesPrecommitPeekTimeout)
+	if hasResult && result.failure != nil {
+		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
+	}
 	if err != nil {
 		cleanupDone := prepared.abortAndWait(upstreamErrorDetailDrainTimeout)
 		delivery := requestDeliveredOrAmbiguous

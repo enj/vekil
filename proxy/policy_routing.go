@@ -881,6 +881,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		MaxResponseBytes:    policyClassifierResponseLimit,
 	}
 	return newPolicyHTTPClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+		ctx = withTaskInferenceKind(ctx, taskClassifier)
 		prepared, err := preparePolicyClassifierBody(body, target)
 		if err != nil {
 			return policyClassifierHTTPResponse{}, err
@@ -921,9 +922,20 @@ func (h *ProxyHandler) sendPolicyClassifierNativeChat(ctx context.Context, targe
 	if err := ctx.Err(); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
+	permit, blocked, admissionErr := h.acquireCopilotInference(req)
+	if admissionErr != nil || blocked != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		if blocked != nil {
+			return readPolicyClassifierHTTPResponse(blocked)
+		}
+		return policyClassifierHTTPResponse{}, admissionErr
+	}
 	observation := newRouteSendObservation(time.Now(), nil)
 	markPolicyClassifierDispatched(ctx)
 	resp, err := h.singleInferenceSend(req, observation)
+	h.finishCopilotInference(req, resp, err, permit)
 	if err != nil {
 		// Only failures proven to occur before any request bytes were written
 		// may affect shared health. Delivery-ambiguous resets stay local.
@@ -970,9 +982,20 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	if err := ctx.Err(); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
+	permit, blocked, admissionErr := h.acquireCopilotInference(req)
+	if admissionErr != nil || blocked != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		if blocked != nil {
+			return readPolicyClassifierHTTPResponse(blocked)
+		}
+		return policyClassifierHTTPResponse{}, admissionErr
+	}
 	observation := newRouteSendObservation(time.Now(), nil)
 	markPolicyClassifierDispatched(ctx)
 	resp, err := h.singleInferenceSend(req, observation)
+	h.finishCopilotInference(req, resp, err, permit)
 	if err != nil {
 		preSend := !observation.wroteHeaders.Load() && !observation.wroteRequest.Load()
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, preSend)
@@ -1107,6 +1130,7 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 			PromptTokens        int64 `json:"prompt_tokens"`
 			CompletionTokens    int64 `json:"completion_tokens"`
 			TotalTokens         int64 `json:"total_tokens"`
+			ReasoningTokens     int64 `json:"reasoning_tokens"`
 			PromptTokensDetails *struct {
 				CachedTokens int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
@@ -1125,6 +1149,9 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 	}
 	if envelope.Usage.CompletionTokensDetails != nil {
 		usage.ReasoningTokens = envelope.Usage.CompletionTokensDetails.ReasoningTokens
+	}
+	if usage.ReasoningTokens <= 0 {
+		usage.ReasoningTokens = envelope.Usage.ReasoningTokens
 	}
 	return usage.normalized()
 }

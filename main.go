@@ -384,6 +384,7 @@ type serveFlags struct {
 	copilotGitHubAPIVersion         *string
 	copilotOpenAIIntent             *string
 	responsesWSEnabled              *bool
+	responsesWSNativeUpstream       *bool
 	responsesWSTurnStateDelta       *bool
 	responsesWSDisableAutoCompact   *bool
 	responsesWSCompactMaxItems      *int
@@ -411,6 +412,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
 		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSNativeUpstream:       fs.Bool("responses-ws-native-upstream", getEnvBool("RESPONSES_WS_NATIVE_UPSTREAM", false), "Use native upstream Copilot Responses websockets for websocket sessions"),
 		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
 		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
 		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
@@ -443,6 +445,7 @@ func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
 func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	return proxy.ResponsesWebSocketConfig{
 		Enabled:             *f.responsesWSEnabled,
+		NativeUpstream:      *f.responsesWSNativeUpstream,
 		TurnStateDelta:      *f.responsesWSTurnStateDelta,
 		DisableAutoCompact:  *f.responsesWSDisableAutoCompact,
 		AutoCompactMaxItems: *f.responsesWSCompactMaxItems,
