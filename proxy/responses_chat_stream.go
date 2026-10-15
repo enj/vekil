@@ -493,9 +493,10 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	if s.hasSequence && header.SequenceNumber != s.sequence+1 {
-		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses stream sequence is not contiguous")
-	}
+	// Numeric sequence metadata does not reassemble the stream. A discontinuity
+	// must not discard a structurally valid turn. Visible output is admitted by
+	// semantic predecessors below, while item/content/terminal validation still
+	// rejects corruption; numeric tolerance must not admit reordered text.
 	s.hasSequence = true
 	s.sequence = header.SequenceNumber
 
@@ -791,6 +792,21 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 	part := message.parts[*event.ContentIndex]
 	if part == nil || part.kind != kind || part.valueDone || part.partDone || !part.matches(event.ItemID, event.OutputIndex, event.ContentIndex) {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "output text delta correlation is invalid")
+	}
+	// Admit visible output by semantic indexes, not sequence metadata. The first
+	// missing predecessor bounds each scan; the byte count caches admission.
+	if event.Delta != "" && part.bytes == 0 {
+		for index := 0; index < part.contentIndex; index++ {
+			if previous := message.parts[index]; previous == nil || !previous.valueDone {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant content parts are out of order")
+			}
+		}
+		for index := 0; index < part.outputIndex; index++ {
+			itemType, known := s.itemsByIndex[index]
+			if !known || (itemType == "message" && !s.doneByIndex[index]) {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant output messages are out of order")
+			}
+		}
 	}
 	if s.visibleBytesCharged {
 		if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
