@@ -343,7 +343,6 @@ type responsesChatMessageState struct {
 
 type responsesChatToolState struct {
 	outputIndex   int
-	denseIndex    int
 	upstreamCall  string
 	name          string
 	arguments     strings.Builder
@@ -443,8 +442,7 @@ func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage, copilot
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, proxyID string) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, proxyID string, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
 		ID:    proxyID,
@@ -457,8 +455,7 @@ func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, 
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolState) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolState, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
 		Index: &index,
@@ -715,7 +712,6 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		}
 		tool := &responsesChatToolState{
 			outputIndex:  *event.OutputIndex,
-			denseIndex:   len(s.tools),
 			upstreamCall: event.Item.CallID,
 			name:         event.Item.Name,
 		}
@@ -1209,18 +1205,14 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			return usageFailureTransition, replayErr
 		}
 		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published, s.config.Carrier)
-		proxyByUpstream := make(map[string]string, len(published.Calls))
-		for _, call := range published.Calls {
-			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
-		}
-		for _, tool := range s.tools {
-			proxyID := proxyByUpstream[tool.upstreamCall]
-			if proxyID == "" {
+		for index, call := range published.Calls {
+			tool := s.toolsByIndex[call.OutputItemIndex]
+			if tool == nil || call.ProxyCallID == "" {
 				return responsesChatStreamTransition{}, newChatServerError("responses_replay_state_invalid", "published Responses replay state is incomplete")
 			}
-			chunks = append(chunks, s.toolStartChunk(tool, proxyID))
+			chunks = append(chunks, s.toolStartChunk(tool, call.ProxyCallID, index))
 			if tool.arguments.Len() > 0 {
-				chunks = append(chunks, s.toolArgumentsChunk(tool))
+				chunks = append(chunks, s.toolArgumentsChunk(tool, index))
 			}
 		}
 	}

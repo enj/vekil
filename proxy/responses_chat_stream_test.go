@@ -53,6 +53,36 @@ func responsesChatStreamSequenceFixtures(t *testing.T, fixture []byte) []struct 
 	}
 }
 
+func responsesChatStreamParallelToolFixtures(t *testing.T) []struct {
+	name string
+	data []byte
+} {
+	t.Helper()
+	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
+	variants := responsesChatStreamSequenceFixtures(t, fixture)
+	frames := bytes.Split(fixture, []byte("\n\n"))
+	if len(frames) < 4 || !bytes.HasPrefix(frames[2], []byte("event: response.output_item.added\n")) || !bytes.HasPrefix(frames[3], []byte("event: response.output_item.added\n")) {
+		t.Fatal("parallel fixture does not have the expected tool announcements")
+	}
+	frames[2], frames[3] = frames[3], frames[2]
+	return append(variants, struct {
+		name string
+		data []byte
+	}{"swapped tool announcements", bytes.Join(frames, []byte("\n\n"))}, struct {
+		name string
+		data []byte
+	}{"numeric-only announcement step back", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 {
+		switch index {
+		case 2:
+			return 3
+		case 3:
+			return 2
+		default:
+			return int64(index)
+		}
+	})})
+}
+
 func TestResponsesChatStream_SequenceDiscontinuitiesPreserveText(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
 	config := responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second}
@@ -115,6 +145,31 @@ func TestResponsesChatStream_SequenceGapsRetainValidation(t *testing.T) {
 	duplicateDelta = append(duplicateDelta, text[4:]...)
 	missingCompletion := append([]string(nil), text[:8]...)
 	missingCompletion = append(missingCompletion, text[9:]...)
+	terminalReordered := append([]string(nil), tools...)
+	_, terminalData, ok := strings.Cut(terminalReordered[len(terminalReordered)-1], "\ndata: ")
+	if !ok {
+		t.Fatal("parallel fixture has no terminal data")
+	}
+	var terminal map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(terminalData), &terminal); err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(terminal["response"], &response); err != nil {
+		t.Fatal(err)
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(response["output"], &output); err != nil || len(output) != 2 {
+		t.Fatalf("parallel terminal output = %q, error = %v", response["output"], err)
+	}
+	output[0], output[1] = output[1], output[0]
+	response["output"], _ = json.Marshal(output)
+	terminal["response"], _ = json.Marshal(response)
+	reorderedData, err := json.Marshal(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalReordered[len(terminalReordered)-1] = "event: response.completed\ndata: " + string(reorderedData)
 	tests := []struct {
 		name        string
 		fixture     string
@@ -130,6 +185,7 @@ func TestResponsesChatStream_SequenceGapsRetainValidation(t *testing.T) {
 		{"duplicate semantic delta is not deduplicated", join(duplicateDelta), "invalid_responses_stream", "output text completion does not match streamed deltas", true, 0},
 		{"authoritative arguments differ", replace(tools, 7, "beta-fixture", "different-region"), "invalid_responses_stream", "completed function arguments diverge from streamed deltas", false, 0},
 		{"terminal arguments differ", replace(tools, 12, "alpha-fixture", "different-widget"), "unsupported_responses_output", "terminal function call does not match streamed arguments", false, 42},
+		{"terminal call order differs", join(terminalReordered), "unsupported_responses_output", "terminal function call does not match streamed arguments", false, 42},
 		{"terminal requires item completion", join(missingCompletion), "invalid_responses_stream", "response.completed arrived before output completion", true, 17},
 		{"unknown event", strings.ReplaceAll(join(text[:4]), "response.content_part.added", "response.future_event"), "unsupported_responses_event", `upstream Responses event "response.future_event" is not supported`, false, 0},
 		{"SSE name mismatch", replace(text, 3, "event: response.content_part.added", "event: response.output_item.added"), "invalid_responses_stream", "Responses SSE event name does not match its JSON type", false, 0},
@@ -574,9 +630,8 @@ func TestResponsesChatStream_ImmediateFailureBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T) {
-	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
-	for _, tt := range responsesChatStreamSequenceFixtures(t, fixture) {
+func TestResponsesChatStream_ParallelToolsUseDenseOutputIndexes(t *testing.T) {
+	for _, tt := range responsesChatStreamParallelToolFixtures(t) {
 		t.Run(tt.name, func(t *testing.T) {
 			store := newResponsesChatReplayStore()
 			t.Cleanup(func() { _ = store.Close() })
@@ -651,6 +706,136 @@ func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T)
 				if call.CallID != wantUpstreamIDs[i] || call.Name != wantNames[i] || call.Arguments != wantArguments[i] {
 					t.Fatalf("replayed call %d = %#v", i, call)
 				}
+			}
+		})
+	}
+}
+
+func TestResponsesChatStream_ParallelToolsReplayActualAggregatedAssistant(t *testing.T) {
+	wantNames := []string{"lookup_synthetic_widget", "inspect_synthetic_region"}
+	wantArguments := []string{`{"widget":"alpha-fixture"}`, `{"region":"beta-fixture"}`}
+	wantUpstreamIDs := []string{"call_synth_parallel_alpha_stream_001", "call_synth_parallel_beta_stream_001"}
+	wantCalls := []map[string]any{
+		{"type": "function_call", "id": "fc_synth_parallel_alpha_stream_001", "call_id": wantUpstreamIDs[0], "name": wantNames[0], "arguments": wantArguments[0], "status": "completed"},
+		{"type": "function_call", "id": "fc_synth_parallel_beta_stream_001", "call_id": wantUpstreamIDs[1], "name": wantNames[1], "arguments": wantArguments[1], "status": "completed"},
+	}
+	for _, tt := range responsesChatStreamParallelToolFixtures(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route, PrecommitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := aggregateChatStreamEvents(stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Choices) != 1 || len(response.Choices[0].Message.ToolCalls) != 2 {
+				t.Fatalf("aggregated response = %#v", response)
+			}
+			assistant := response.Choices[0].Message
+			content, err := translateChatMessageContent(assistant.Content, assistant.Role, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projectionContent, err := json.Marshal(assistantHistoryText(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxyIDs := make(map[string]string, len(assistant.ToolCalls))
+			projection := responsesChatReplayAssistantProjection{Content: projectionContent}
+			for _, call := range assistant.ToolCalls {
+				proxyIDs[call.Function.Name] = call.ID
+				projection.Calls = append(projection.Calls, responsesChatReplayProjectedCall{
+					ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments,
+				})
+			}
+			if proxyIDs[wantNames[0]] == "" || proxyIDs[wantNames[1]] == "" {
+				t.Fatalf("aggregated tools = %#v", assistant.ToolCalls)
+			}
+			t.Run("canonical assistant order", func(t *testing.T) {
+				for index, call := range assistant.ToolCalls {
+					if call.Function.Name != wantNames[index] || call.Function.Arguments != wantArguments[index] {
+						t.Errorf("aggregated tool %d = %#v", index, call)
+					}
+				}
+			})
+			t.Run("actual replay projection", func(t *testing.T) {
+				resolved, err := store.Resolve(route, projection)
+				if err != nil {
+					t.Fatalf("Resolve(actual aggregated assistant) = %T: %v", err, err)
+				}
+				var calls []map[string]any
+				for _, raw := range resolved.OutputItems {
+					var call map[string]any
+					if err := json.Unmarshal(raw, &call); err != nil {
+						t.Fatal(err)
+					}
+					calls = append(calls, call)
+				}
+				if !reflect.DeepEqual(calls, wantCalls) {
+					t.Fatalf("replayed calls = %#v, want %#v", calls, wantCalls)
+				}
+			})
+			for _, continuation := range []struct {
+				name    string
+				results []map[string]any
+				want    []map[string]any
+			}{
+				{
+					name: "full reversed results",
+					results: []map[string]any{
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[1]], "content": "result beta"},
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[0]], "content": "result alpha"},
+					},
+					want: append(append([]map[string]any(nil), wantCalls...),
+						map[string]any{"type": "function_call_output", "call_id": wantUpstreamIDs[1], "output": "result beta"},
+						map[string]any{"type": "function_call_output", "call_id": wantUpstreamIDs[0], "output": "result alpha"}),
+				},
+				{
+					name: "partial beta result",
+					results: []map[string]any{
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[1]], "content": "result beta"},
+					},
+					want: []map[string]any{
+						wantCalls[1],
+						{"type": "function_call_output", "call_id": wantUpstreamIDs[1], "output": "result beta"},
+					},
+				},
+			} {
+				t.Run(continuation.name, func(t *testing.T) {
+					messages := []any{assistant}
+					for _, result := range continuation.results {
+						messages = append(messages, result)
+					}
+					request, err := json.Marshal(map[string]any{"model": "gpt-public", "messages": messages})
+					if err != nil {
+						t.Fatal(err)
+					}
+					plan, err := translateChatRequestToResponses(request, responsesChatRequestOptions{
+						UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
+					})
+					if err != nil {
+						var executionErr *chatExecutionError
+						if errors.As(err, &executionErr) {
+							t.Fatalf("unchanged assistant continuation: status=%d code=%s: %v", executionErr.StatusCode, executionErr.Code, err)
+						}
+						t.Fatal(err)
+					}
+					var upstream struct {
+						Input []map[string]any `json:"input"`
+					}
+					if err := json.Unmarshal(plan.Body, &upstream); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(upstream.Input, continuation.want) {
+						t.Fatalf("continued input = %#v, want %#v", upstream.Input, continuation.want)
+					}
+				})
 			}
 		})
 	}
