@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -637,8 +638,11 @@ func extractToolResultContent(raw json.RawMessage, result int) (string, []models
 				source.MediaType = strings.ToLower(source.MediaType)
 				block.Source = &source
 			}
-			if block.Source != nil && block.Source.Type == "url" && !strings.HasPrefix(block.Source.URL, "http://") && !strings.HasPrefix(block.Source.URL, "https://") {
-				return "", nil, fmt.Errorf("tool_result url image source requires an HTTP(S) URL")
+			if block.Source != nil && block.Source.Type == "url" {
+				parsed, err := url.Parse(block.Source.URL)
+				if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+					return "", nil, fmt.Errorf("tool_result url image source requires an HTTP(S) URL")
+				}
 			}
 			part, err := translateAnthropicImageBlock(block)
 			if err != nil {

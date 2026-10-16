@@ -26,6 +26,11 @@ change Responses-backed partial-result replay. Other nested content types and
 malformed image sources fail before a translated send. Policy-routed requests
 remain text/function-tool only.
 
+Tool-result URL sources require HTTP(S) with a host; scheme matching is
+case-insensitive. Original URL strings are preserved, including escaped path and
+query bytes. Base64 images use their separate source type; URL-typed data URLs
+remain rejected.
+
 Supported Anthropic cache hints map to Copilot message/tool
 `copilot_cache_control` only when the original source-prefix boundary can be
 represented exactly, including deferred images. Hints crossing reordered sibling

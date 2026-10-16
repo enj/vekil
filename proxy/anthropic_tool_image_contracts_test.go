@@ -165,6 +165,80 @@ func TestAnthropicToolImageMixedContentKeepsSlotsAndTrustBoundary(t *testing.T) 
 	}
 }
 
+func TestAnthropicToolImageSourcesPreserveOriginalThroughResponses(t *testing.T) {
+	const escapedLocation = "://images.invalid/frames%2Fone%2ftwo.png?signature=A%2FB%2fc&space=one+two&token=%252f"
+	const preamble = "Tool result 1 image 1 (tool results numbered in conversation order; attachment from tool output):"
+	for _, test := range []struct {
+		name   string
+		url    string
+		base64 bool
+	}{
+		{name: "http", url: "http" + escapedLocation},
+		{name: "hTtP", url: "hTtP" + escapedLocation},
+		{name: "HTTP", url: "HTTP" + escapedLocation},
+		{name: "https", url: "https" + escapedLocation},
+		{name: "HtTpS", url: "HtTpS" + escapedLocation},
+		{name: "HTTPS", url: "HTTPS" + escapedLocation},
+		{name: "base64 source", url: "data:image/png;base64,QQ==", base64: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			image := toolImageContractURL(test.url)
+			if test.base64 {
+				image = map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "IMAGE/PNG", "data": "QQ=="}}
+			}
+			request := toolImageContractRequest(t, []any{
+				toolImageContractAssistant("call_a"),
+				map[string]any{"role": "user", "content": []any{toolImageContractResult("call_a", []any{
+					map[string]any{"type": "text", "text": "before"}, image, map[string]any{"type": "text", "text": "after"},
+				})}},
+			})
+			original := toolImageContractJSON(t, request)
+			chat, err := TranslateAnthropicToOpenAI(request)
+			if err != nil {
+				t.Fatalf("valid image source rejected: %v", err)
+			}
+			if !bytes.Equal(toolImageContractJSON(t, request), original) {
+				t.Fatal("image translation mutated the Anthropic source")
+			}
+			if err := validateCompleteImageToolHistory(chat.Messages); err != nil {
+				t.Fatal(err)
+			}
+			if len(chat.Messages) != 3 || chat.Messages[1].Role != "tool" || chat.Messages[1].ToolCallID != "call_a" || jsonRawString(chat.Messages[1].Content) != "before[Tool result 1 image 1]after" {
+				t.Fatalf("tool/image association changed: %+v", chat.Messages)
+			}
+			parts := toolImageContractParts(t, chat.Messages[2])
+			if len(parts) != 2 || parts[0].Type != "text" || parts[0].Text == nil || *parts[0].Text != preamble || parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != test.url {
+				t.Fatalf("Chat attachment = %+v, want fixed provenance and original URL %q", parts, test.url)
+			}
+			plan, err := translateChatRequestToResponses(toolImageContractJSON(t, chat), responsesChatRequestOptions{})
+			if err != nil {
+				t.Fatalf("valid canonical image rejected by Responses conversion: %v", err)
+			}
+			var input []map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(upstreamInputJSON(t, plan)), &input); err != nil {
+				t.Fatal(err)
+			}
+			var images []string
+			for _, item := range input {
+				if jsonRawString(item["role"]) != "user" {
+					continue
+				}
+				var parts []map[string]json.RawMessage
+				if err := json.Unmarshal(item["content"], &parts); err != nil {
+					t.Fatal(err)
+				}
+				if len(parts) != 2 || jsonRawString(parts[0]["type"]) != "input_text" || jsonRawString(parts[0]["text"]) != preamble || jsonRawString(parts[1]["type"]) != "input_image" {
+					t.Fatalf("Responses attachment lost provenance or image type: %s", item["content"])
+				}
+				images = append(images, jsonRawString(parts[1]["image_url"]))
+			}
+			if !slices.Equal(images, []string{test.url}) {
+				t.Fatalf("Responses images = %q, want one unchanged source URL %q", images, test.url)
+			}
+		})
+	}
+}
+
 func TestAnthropicToolImageSiblingsRoundsAndRealBoundaries(t *testing.T) {
 	for _, grouping := range []struct {
 		name     string
@@ -786,7 +860,12 @@ func TestAnthropicToolImageMalformedContentFailsBeforeDispatch(t *testing.T) {
 		{name: "missing image source", content: []any{map[string]any{"type": "image"}}, cause: "image content block is missing source"},
 		{name: "bad base64", content: []any{map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "not-base64!"}}}, cause: "tool_result image requires an HTTP(S) URL or valid base64 image data"},
 		{name: "non HTTP URL", content: []any{toolImageContractURL("ftp://images.invalid/a.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
-		{name: "URL without host", content: []any{toolImageContractURL("https:///missing-host.png")}, cause: "tool_result image requires an HTTP(S) URL or valid base64 image data"},
+		{name: "file URL", content: []any{toolImageContractURL("file:///tmp/a.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
+		{name: "relative URL", content: []any{toolImageContractURL("/frames/a.png?frame=1")}, cause: "tool_result url image source requires an HTTP(S) URL"},
+		{name: "scheme relative URL", content: []any{toolImageContractURL("//images.invalid/a.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
+		{name: "malformed URL", content: []any{toolImageContractURL("HtTpS://images.invalid/%zz")}, cause: "tool_result url image source requires an HTTP(S) URL"},
+		{name: "URL typed base64 data", content: []any{toolImageContractURL("data:image/png;base64,QQ==")}, cause: "tool_result url image source requires an HTTP(S) URL"},
+		{name: "URL without host", content: []any{toolImageContractURL("https:///missing-host.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
 		{name: "empty base64 data", content: []any{map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": ""}}}, cause: "base64 image source requires non-empty data"},
 		{name: "base64 decodes to empty data", content: []any{map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "\r\n"}}}, cause: "base64 image source requires non-empty data"},
 		{name: "empty data URL", content: []any{toolImageContractURL("data:image/png;base64,")}, cause: "tool_result url image source requires an HTTP(S) URL"},
