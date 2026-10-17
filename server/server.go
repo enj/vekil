@@ -433,6 +433,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	mux.HandleFunc("POST /mcp/web-search", handler.HandleWebSearchMCP)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
@@ -587,6 +588,12 @@ func (s *Server) ModelUsesCopilot(model string) bool {
 // UsesCopilot reports whether the active serve scope needs Copilot auth.
 func (s *Server) UsesCopilot() bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.UsesCopilot()
+}
+
+// MessagesAliasResolvesTo reports whether a Messages request naming alias is
+// served like one naming model.
+func (s *Server) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.MessagesAliasResolvesTo(ctx, alias, model)
 }
 
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.

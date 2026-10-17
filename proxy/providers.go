@@ -827,6 +827,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	ctx, cancel := context.WithTimeout(ctx, modelsUpstreamTimeout)
 	defer cancel()
 
+	catalogs := make(map[string][]providerModel)
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
@@ -847,6 +848,14 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 			return nil, err
 		}
 		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
+			return nil, err
+		}
+		catalogs[providerID] = result.models
+	}
+	// Auxiliary models join only after every catalog is registered, so a
+	// later provider's reservation makes them fall back instead of failing.
+	if len(h.auxiliaryModels) > 0 && len(catalogs) > 0 {
+		if err := h.replaceInstalledProviderModels(setup, catalogs); err != nil {
 			return nil, err
 		}
 	}
@@ -881,9 +890,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return err
 		}
-		replacements[providerID] = h.filterAllowedModels(result.models)
+		replacements[providerID] = result.models
 	}
-	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, replacements); err != nil {
 		return err
 	}
 
@@ -1062,6 +1071,113 @@ func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetu
 		}
 		if providerCanExposeModel(provider, model) {
 			return true
+		}
+	}
+	return false
+}
+
+// auxiliaryModelAllowed admits an auxiliary model only when every provider a
+// request for it can reach is already in the allowed-model scope. Ownership is
+// resolved the way dispatch resolves it: a public route first, with all of its
+// targets in scope, then a catalog model, then, for a model not yet
+// discovered, the default provider when it discovers models dynamically.
+func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model, endpoint string) bool {
+	if _, ok := h.auxiliaryModels[model]; !ok || len(h.allowedModels) == 0 {
+		return false
+	}
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		return false
+	}
+	if route, ok := h.resolveModelRouteForRequest(model, endpoint); ok {
+		if route == nil || len(route.targets) == 0 {
+			return false
+		}
+		for _, target := range route.targets {
+			if !h.providerWithinAllowedModelScope(target.provider) {
+				return false
+			}
+		}
+		return true
+	}
+	if owner, ok := setup.lookupModel(model); ok {
+		return h.providerWithinAllowedModelScope(setup.providerByID(owner.providerID))
+	}
+	defaultProvider := setup.defaultProvider()
+	return providerUsesDynamicModels(defaultProvider) && h.providerWithinAllowedModelScope(defaultProvider)
+}
+
+// installedProviderModels is the part of a provider catalog kept for routing:
+// the allowed models plus the auxiliary models this provider serves when it
+// also serves an allowed model and no other provider or route claims the
+// auxiliary ID. Public listings keep filtering by the allowed models alone.
+func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID string, models []providerModel) []providerModel {
+	installed := h.filterAllowedModels(models)
+	if len(h.allowedModels) == 0 || len(h.auxiliaryModels) == 0 ||
+		(len(installed) == 0 && !h.allowedRouteTargetsProvider(setup, providerID)) {
+		return installed
+	}
+	for _, model := range models {
+		if _, ok := h.auxiliaryModels[model.publicID]; !ok {
+			continue
+		}
+		if _, allowed := h.allowedModels[model.publicID]; allowed {
+			continue // already installed as an allowed model
+		}
+		if owner, ok := setup.lookupModel(model.publicID); ok && owner.providerID != providerID {
+			continue
+		}
+		if route, ok := setup.lookupRoute(model.publicID); ok && route != nil && !route.legacy {
+			continue
+		}
+		if entry, ok := setup.lookupPublicModelEntry(model.publicID); ok && entry != nil && entry.kind == publicEntryPolicy {
+			continue
+		}
+		installed = append(installed, model)
+	}
+	return installed
+}
+
+// replaceInstalledProviderModels replaces provider catalogs with their
+// auxiliary models. If those collide with any model, route, or alias
+// reservation, it retries without them: an auxiliary model must never fail
+// startup or a catalog refresh.
+func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, catalogs map[string][]providerModel) error {
+	withAuxiliary := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		withAuxiliary[providerID] = h.installedProviderModels(setup, providerID, models)
+	}
+	err := setup.replaceProviderModelsBatch(withAuxiliary)
+	if err == nil || len(h.auxiliaryModels) == 0 {
+		return err
+	}
+	allowedOnly := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		allowedOnly[providerID] = h.filterAllowedModels(models)
+	}
+	return setup.replaceProviderModelsBatch(allowedOnly)
+}
+
+// allowedRouteTargetsProvider reports whether an allowed explicit route or
+// policy profile in setup dispatches to providerID, whose catalog then holds
+// upstream models rather than the allowed public IDs.
+func (h *ProxyHandler) allowedRouteTargetsProvider(setup *providerSetup, providerID string) bool {
+	provider := setup.providerByID(providerID)
+	if provider == nil {
+		return false
+	}
+	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
+				return true
+			}
+			continue
+		}
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == providerID {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -2041,6 +2157,9 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 		return true
 	}
 	if _, ok := h.allowedModels[model]; ok {
+		return true
+	}
+	if h.auxiliaryModelAllowed(setup, model, endpoint) {
 		return true
 	}
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {

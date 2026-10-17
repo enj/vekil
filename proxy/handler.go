@@ -255,6 +255,7 @@ type ProxyHandler struct {
 	azureTraffic                     azureTrafficController
 	providersConfig                  ProvidersConfig
 	allowedModels                    map[string]struct{}
+	auxiliaryModels                  map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	policyRoutingMode                PolicyRoutingMode
@@ -934,6 +935,23 @@ func WithAllowedModels(models ...string) Option {
 		for _, model := range models {
 			if model = strings.TrimSpace(model); model != "" {
 				h.allowedModels[model] = struct{}{}
+			}
+		}
+	}
+}
+
+// WithAuxiliaryModels admits models an agent needs beside the allowed ones,
+// such as Claude Code's auto-mode classifier. Each is admitted only when a
+// provider already serving an allowed model owns it, so auxiliary models never
+// widen provider discovery or credentials.
+func WithAuxiliaryModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.auxiliaryModels == nil {
+			h.auxiliaryModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.auxiliaryModels[model] = struct{}{}
 			}
 		}
 	}
@@ -1873,7 +1891,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			}
 			allDynamicProvidersUnchanged = false
 			if canonicalRefresh {
-				refreshedDynamicModels[provider.id] = models
+				refreshedDynamicModels[provider.id] = filterHiddenProviderModels(provider, filterProviderModels(provider, result.models))
 			}
 			if result.etag != "" {
 				mergedETag = result.etag
@@ -1906,7 +1924,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	if err := setup.replaceProviderModelsBatch(refreshedDynamicModels); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, refreshedDynamicModels); err != nil {
 		return cachedModelsResponse{}, false, err
 	}
 
