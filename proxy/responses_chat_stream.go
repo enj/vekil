@@ -343,7 +343,6 @@ type responsesChatMessageState struct {
 
 type responsesChatToolState struct {
 	outputIndex   int
-	denseIndex    int
 	upstreamCall  string
 	name          string
 	arguments     strings.Builder
@@ -443,8 +442,7 @@ func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage, copilot
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, proxyID string) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, proxyID string, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
 		ID:    proxyID,
@@ -457,8 +455,7 @@ func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, 
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolState) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolState, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
 		Index: &index,
@@ -493,9 +490,10 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	if s.hasSequence && header.SequenceNumber != s.sequence+1 {
-		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses stream sequence is not contiguous")
-	}
+	// Numeric sequence metadata does not reassemble the stream. A discontinuity
+	// must not discard a structurally valid turn. Visible output is admitted by
+	// semantic predecessors below, while item/content/terminal validation still
+	// rejects corruption; numeric tolerance must not admit reordered text.
 	s.hasSequence = true
 	s.sequence = header.SequenceNumber
 
@@ -714,7 +712,6 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		}
 		tool := &responsesChatToolState{
 			outputIndex:  *event.OutputIndex,
-			denseIndex:   len(s.tools),
 			upstreamCall: event.Item.CallID,
 			name:         event.Item.Name,
 		}
@@ -791,6 +788,21 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 	part := message.parts[*event.ContentIndex]
 	if part == nil || part.kind != kind || part.valueDone || part.partDone || !part.matches(event.ItemID, event.OutputIndex, event.ContentIndex) {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "output text delta correlation is invalid")
+	}
+	// Admit visible output by semantic indexes, not sequence metadata. The first
+	// missing predecessor bounds each scan; the byte count caches admission.
+	if event.Delta != "" && part.bytes == 0 {
+		for index := 0; index < part.contentIndex; index++ {
+			if previous := message.parts[index]; previous == nil || !previous.valueDone {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant content parts are out of order")
+			}
+		}
+		for index := 0; index < part.outputIndex; index++ {
+			itemType, known := s.itemsByIndex[index]
+			if !known || (itemType == "message" && !s.doneByIndex[index]) {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant output messages are out of order")
+			}
+		}
 	}
 	if s.visibleBytesCharged {
 		if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
@@ -1193,18 +1205,14 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			return usageFailureTransition, replayErr
 		}
 		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published, s.config.Carrier)
-		proxyByUpstream := make(map[string]string, len(published.Calls))
-		for _, call := range published.Calls {
-			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
-		}
-		for _, tool := range s.tools {
-			proxyID := proxyByUpstream[tool.upstreamCall]
-			if proxyID == "" {
+		for index, call := range published.Calls {
+			tool := s.toolsByIndex[call.OutputItemIndex]
+			if tool == nil || call.ProxyCallID == "" {
 				return responsesChatStreamTransition{}, newChatServerError("responses_replay_state_invalid", "published Responses replay state is incomplete")
 			}
-			chunks = append(chunks, s.toolStartChunk(tool, proxyID))
+			chunks = append(chunks, s.toolStartChunk(tool, call.ProxyCallID, index))
 			if tool.arguments.Len() > 0 {
-				chunks = append(chunks, s.toolArgumentsChunk(tool))
+				chunks = append(chunks, s.toolArgumentsChunk(tool, index))
 			}
 		}
 	}

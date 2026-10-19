@@ -14,11 +14,29 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+Translated tool results may contain text and base64/URL images. Text stays in the
+`tool` message, with numbered slots marking the original image positions. Images
+become separate user-role attachments after the available contiguous tool-result
+run, including results split across consecutive source messages. Fixed numeric
+labels bind attachments to tool-result order without copying arbitrary tool text
+or client-chosen IDs into user-role instructions. This is an attachment lowering,
+not native tool-role multimodality; native Messages forwarding keeps its upstream
+content contract. It does not make incomplete native-Chat tool histories valid or
+change Responses-backed partial-result replay. Other nested content types and
+malformed image sources fail before a translated send. Policy-routed requests
+remain text/function-tool only.
+
+Tool-result URL sources require HTTP(S) with a host; scheme matching is
+case-insensitive. Original URL strings are preserved, including escaped path and
+query bytes. Base64 images use their separate source type; URL-typed data URLs
+remain rejected.
+
 Supported Anthropic cache hints map to Copilot message/tool
-`copilot_cache_control` only when the original cache boundary can be represented
-exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other
-unsupported multimodal tool results also fail before a translated Chat send;
-native Messages forwarding retains its upstream content contract.
+`copilot_cache_control` only when the original source-prefix boundary can be
+represented exactly, including deferred images. Hints crossing reordered sibling
+results or real content fail explicitly rather than moving or dropping the
+boundary. Tool-output optimization retains its actual tool-role text; cache
+mapping does not reconstruct the original output.
 
 ## `POST /v1/messages/count_tokens` (Anthropic)
 
@@ -94,7 +112,7 @@ Vekil resolves the public model once and chooses its native backend:
 
 Provider policy plus the selected model's or explicit route's native endpoint allowlist control this choice. A `/responses`-only model is served through the adapter rather than probed at an unsupported Chat path; Vekil fails locally with `400` only when neither native endpoint is allowed. Explicit route targets remain ordered and bounded by the route's target-attempt and upstream-send budgets.
 
-A native Chat request remains near-zero-copy. Successful non-streaming responses are conservatively normalized to strict OpenAI Chat Completions shape when upstreams omit required compatibility fields: missing `object` becomes `"chat.completion"`, missing `created`/`id`/`usage` are filled, requested `model` is used when absent, and choice `message`/`index`/`finish_reason` gaps are repaired while vendor-specific metadata is preserved. Streaming chunks are similarly repaired only for missing envelope fields such as `object: "chat.completion.chunk"`, `id`, `created`, `model`, `choices[].index`, and `choices[].delta`. Legacy raw Chat routes preserve a nonempty upstream `model`; explicit routes replace physical model/deployment values with the route public ID in supported JSON and SSE responses. When tools are present, Vekil injects `parallel_tool_calls: true`, may force upstream streaming for reliable parallel calls, and aggregates back to non-streaming JSON when the client did not request a stream.
+A native Chat request remains near-zero-copy. Successful non-streaming responses are conservatively normalized to strict OpenAI Chat Completions shape when upstreams omit required compatibility fields: missing `object` becomes `"chat.completion"`, missing `created`/`id`/`usage` are filled, requested `model` is used when absent, and choice `message`/`index`/`finish_reason` gaps are repaired while vendor-specific metadata is preserved. Streaming chunks are similarly repaired only for missing envelope fields such as `object: "chat.completion.chunk"`, `id`, `created`, `model`, `choices[].index`, and `choices[].delta`. Legacy raw Chat routes preserve a nonempty upstream `model`; explicit routes replace physical model/deployment values with the route public ID in supported JSON and SSE responses. When tools are present, Vekil injects `parallel_tool_calls: true`, may force upstream streaming for reliable parallel calls, and aggregates back to non-streaming JSON when the client did not request a stream. For a Google catalog model, image parts beyond its declared limit are replaced, oldest first, by a text placeholder; see [Provider Routing](provider-routing.md).
 
 A Responses-backed request is not passthrough. Vekil validates the supported Chat request shape, converts it to Responses input, converts the result to one canonical Chat choice, and rejects unsupported fields rather than silently dropping them. Direct `/v1/responses` behavior is separate; the adapter does not invoke the public Responses handler, compaction shims, or websocket bridge.
 
@@ -161,16 +179,26 @@ upstream mapping when the ID is self-describing. Carrier signatures are cumulati
 of the client's replayed wire bytes; once the budget is full, or the next complete carrier would
 cross it, Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
 
-`/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
-replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also
-fails on every surface once the originating process is gone, including `/v1/messages`: its tier is
-recovered from a carrier tag keyed per process, so after a restart or on another replica the planner
-cannot select the original tier. Carrier-backed restoration and visible-transcript degradation are
-therefore direct-route Anthropic behaviors.
+Replay IDs that reach a direct-route model with no `/responses` backend, such as after a session
+switches from a Responses-backed model to a Chat-only one, can never be restored there. Anthropic
+ingress and its count-token probe then continue on native `/chat/completions` with the IDs unchanged
+and the hidden reasoning dropped, and log that lost continuity.
+
+`/v1/chat/completions` and `/v1/responses` do not opt into either fallback; when the replay state is
+unavailable or the model has no `/responses` backend, they return `responses_replay_state_missing`. A
+**policy profile** also fails on every surface once the originating process is gone, including
+`/v1/messages`: its tier is recovered from a carrier tag keyed per process, so after a restart or on
+another replica the planner cannot select the original tier. Carrier-backed restoration,
+visible-transcript degradation, and the native-Chat continuation are therefore direct-route Anthropic
+behaviors.
+
+Responses-backed streams expose function calls in validated terminal output order,
+with dense Chat indexes in that order. Numeric sequence discontinuities and
+item-announcement arrival order do not reorder the published replay projection.
 
 For a parallel call group, the assistant `tool_calls` projection must remain complete and in its original order. A complete set of tool-result messages may arrive in any order. If only a non-empty subset of results is available, Vekil replays only the matching prior function calls plus their outputs; this partial projection is required because the verified Responses backend rejected a complete parallel call group paired with only partial outputs. The missing calls may consequently be reissued by the model.
 
-Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID fails locally with:
+Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID, or one sent to a model with no `/responses` backend, fails locally with:
 
 ```text
 HTTP 400
