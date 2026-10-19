@@ -179,12 +179,18 @@ upstream mapping when the ID is self-describing. Carrier signatures are cumulati
 of the client's replayed wire bytes; once the budget is full, or the next complete carrier would
 cross it, Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
 
-`/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
-replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also
-fails on every surface once the originating process is gone, including `/v1/messages`: its tier is
-recovered from a carrier tag keyed per process, so after a restart or on another replica the planner
-cannot select the original tier. Carrier-backed restoration and visible-transcript degradation are
-therefore direct-route Anthropic behaviors.
+Replay IDs that reach a direct-route model with no `/responses` backend, such as after a session
+switches from a Responses-backed model to a Chat-only one, can never be restored there. Anthropic
+ingress and its count-token probe then continue on native `/chat/completions` with the IDs unchanged
+and the hidden reasoning dropped, and log that lost continuity.
+
+`/v1/chat/completions` and `/v1/responses` do not opt into either fallback; when the replay state is
+unavailable or the model has no `/responses` backend, they return `responses_replay_state_missing`. A
+**policy profile** also fails on every surface once the originating process is gone, including
+`/v1/messages`: its tier is recovered from a carrier tag keyed per process, so after a restart or on
+another replica the planner cannot select the original tier. Carrier-backed restoration,
+visible-transcript degradation, and the native-Chat continuation are therefore direct-route Anthropic
+behaviors.
 
 Responses-backed streams expose function calls in validated terminal output order,
 with dense Chat indexes in that order. Numeric sequence discontinuities and
@@ -192,7 +198,7 @@ item-announcement arrival order do not reorder the published replay projection.
 
 For a parallel call group, the assistant `tool_calls` projection must remain complete and in its original order. A complete set of tool-result messages may arrive in any order. If only a non-empty subset of results is available, Vekil replays only the matching prior function calls plus their outputs; this partial projection is required because the verified Responses backend rejected a complete parallel call group paired with only partial outputs. The missing calls may consequently be reissued by the model.
 
-Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID fails locally with:
+Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID, or one sent to a model with no `/responses` backend, fails locally with:
 
 ```text
 HTTP 400
