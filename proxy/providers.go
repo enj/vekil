@@ -186,6 +186,7 @@ type providerModel struct {
 	dropSamplingParams     bool
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
+	maxPromptImages        int
 	disabled               bool
 	endpointsAdvertised    bool
 	raw                    json.RawMessage
@@ -3274,6 +3275,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			providerID:          provider.id,
 			supportedEndpoints:  supportedEndpoints,
 			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
+			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
 			disabled:            disabled,
 			endpointsAdvertised: endpointsAdvertised,
 			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
@@ -3295,6 +3297,26 @@ func providerModelParallelToolCallsFromRaw(raw json.RawMessage) *bool {
 		return nil
 	}
 	return cloneBoolPtr(parsed.Capabilities.Supports.ParallelToolCalls)
+}
+
+// providerModelMaxPromptImagesFromRaw honors the catalog image limit for Google models only.
+// Copilot enforces that limit for Gemini, while other vendors declare limits their endpoints
+// exceed in practice: GPT declares one image and has accepted eleven.
+func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
+	var parsed struct {
+		Vendor       string `json:"vendor"`
+		Capabilities struct {
+			Limits struct {
+				Vision struct {
+					MaxPromptImages int `json:"max_prompt_images"`
+				} `json:"vision"`
+			} `json:"limits"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || !strings.EqualFold(strings.TrimSpace(parsed.Vendor), "Google") {
+		return 0
+	}
+	return max(parsed.Capabilities.Limits.Vision.MaxPromptImages, 0)
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {

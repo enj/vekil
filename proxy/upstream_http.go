@@ -269,7 +269,11 @@ func prepareResolvedProviderRequestBodyWithValidation(
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
 	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
 	dropStopSequences := endpoint == providerEndpointChatCompletions && owner.dropStopSequences
-	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
+	// Every image part spells image_url at least once, so a body at or under the limit
+	// skips decoding its messages.
+	limitImages := endpoint == providerEndpointChatCompletions && owner.maxPromptImages > 0 &&
+		bytes.Count(body, []byte("image_url")) > owner.maxPromptImages
+	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && !limitImages && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
 		return body
 	}
 	var payload map[string]json.RawMessage
@@ -307,6 +311,12 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 			changed = true
 		}
 	}
+	if limitImages {
+		if messages, omitted := omitOldestChatImages(payload["messages"], owner.maxPromptImages); omitted > 0 {
+			payload["messages"] = messages
+			changed = true
+		}
+	}
 	if !changed {
 		return body
 	}
@@ -315,6 +325,77 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 		return body
 	}
 	return rewritten
+}
+
+// omitOldestChatImages keeps the newest limit image parts and replaces each older one with
+// a text part, so a transcript that outgrew a model's per-request image limit still fits.
+func omitOldestChatImages(rawMessages json.RawMessage, limit int) (json.RawMessage, int) {
+	var messages []json.RawMessage
+	if json.Unmarshal(rawMessages, &messages) != nil {
+		return rawMessages, 0
+	}
+	type imageMessage struct {
+		index  int
+		fields map[string]json.RawMessage
+		parts  []json.RawMessage
+		images []int
+	}
+	var withImages []imageMessage
+	total := 0
+	for index, rawMessage := range messages {
+		var fields map[string]json.RawMessage
+		var parts []json.RawMessage
+		if json.Unmarshal(rawMessage, &fields) != nil || json.Unmarshal(fields["content"], &parts) != nil {
+			continue
+		}
+		var images []int
+		for partIndex, rawPart := range parts {
+			var part struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(rawPart, &part) == nil && part.Type == "image_url" {
+				images = append(images, partIndex)
+			}
+		}
+		if len(images) > 0 {
+			withImages = append(withImages, imageMessage{index: index, fields: fields, parts: parts, images: images})
+			total += len(images)
+		}
+	}
+	omit := total - limit
+	if omit <= 0 {
+		return rawMessages, 0
+	}
+	placeholder, err := json.Marshal(map[string]string{
+		"type": "text",
+		"text": fmt.Sprintf("[image omitted: the model accepts at most %d images per request]", limit),
+	})
+	if err != nil {
+		return rawMessages, 0
+	}
+	remaining := omit
+	for _, message := range withImages {
+		if remaining == 0 {
+			break
+		}
+		for _, partIndex := range message.images[:min(remaining, len(message.images))] {
+			message.parts[partIndex] = placeholder
+			remaining--
+		}
+		content, err := json.Marshal(message.parts)
+		if err != nil {
+			return rawMessages, 0
+		}
+		message.fields["content"] = content
+		if messages[message.index], err = json.Marshal(message.fields); err != nil {
+			return rawMessages, 0
+		}
+	}
+	rewritten, err := json.Marshal(messages)
+	if err != nil {
+		return rawMessages, 0
+	}
+	return rewritten, omit
 }
 
 func (h *ProxyHandler) postResolvedProviderRequest(

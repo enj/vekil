@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -1692,5 +1693,181 @@ func TestWriteOpenAIPassthroughObservingUsage_Non200PlainCopy(t *testing.T) {
 	}
 	if summary.totalTokens != nil {
 		t.Fatal("usage should not be observed on a non-200 response")
+	}
+}
+
+func chatImagePart(n int) string {
+	return fmt.Sprintf(`{"type":"image_url","image_url":{"url":"data:image/png;base64,IMG%d"}}`, n)
+}
+
+// chatContentSummary flattens each message's content into its image URLs and text, in order.
+func chatContentSummary(t *testing.T, body []byte) [][]string {
+	t.Helper()
+	var payload struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode Chat body: %v: %s", err, body)
+	}
+	summary := make([][]string, 0, len(payload.Messages))
+	for _, message := range payload.Messages {
+		var text string
+		if json.Unmarshal(message.Content, &text) == nil {
+			summary = append(summary, []string{text})
+			continue
+		}
+		var parts []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			ImageURL struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		}
+		if err := json.Unmarshal(message.Content, &parts); err != nil {
+			t.Fatalf("decode content: %v: %s", err, message.Content)
+		}
+		var flattened []string
+		for _, part := range parts {
+			if part.Type == "image_url" {
+				flattened = append(flattened, part.ImageURL.URL)
+			} else {
+				flattened = append(flattened, part.Text)
+			}
+		}
+		summary = append(summary, flattened)
+	}
+	return summary
+}
+
+func TestApplyProviderModelRequestPolicy_OmitsOldestImagesBeyondLimit(t *testing.T) {
+	body := []byte(`{"model":"gemini-test","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"first"},` + chatImagePart(1) + `]},` +
+		`{"role":"assistant","content":"looking"},` +
+		`{"role":"user","content":[` + chatImagePart(2) + `,` + chatImagePart(3) + `,{"type":"text","text":"latest"}]}]}`)
+	owner := providerModel{maxPromptImages: 2}
+
+	got := chatContentSummary(t, applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, owner))
+	want := [][]string{
+		{"first", "[image omitted: the model accepts at most 2 images per request]"},
+		{"looking"},
+		{"data:image/png;base64,IMG2", "data:image/png;base64,IMG3", "latest"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("content = %q, want the oldest image omitted and the newest two kept in order: %q", got, want)
+	}
+
+	for name, unchanged := range map[string][]byte{
+		"Responses":    applyProviderModelRequestPolicy(body, providerEndpointResponses, owner),
+		"no limit":     applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{}),
+		"within limit": applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{maxPromptImages: 3}),
+	} {
+		if string(unchanged) != string(body) {
+			t.Fatalf("%s: body changed to %s, want original %s", name, unchanged, body)
+		}
+	}
+}
+
+func TestProviderModelMaxPromptImagesFromRawHonorsOnlyGoogle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "Google", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":10}}}}`, want: 10},
+		{name: "vendor case and spacing", raw: `{"vendor":" google ","capabilities":{"limits":{"vision":{"max_prompt_images":10}}}}`, want: 10},
+		{name: "OpenAI declares one", raw: `{"vendor":"OpenAI","capabilities":{"limits":{"vision":{"max_prompt_images":1}}}}`},
+		{name: "Anthropic declares five", raw: `{"vendor":"Anthropic","capabilities":{"limits":{"vision":{"max_prompt_images":5}}}}`},
+		{name: "Google without a vision limit", raw: `{"vendor":"Google","capabilities":{"limits":{"max_prompt_tokens":1000}}}`},
+		{name: "negative limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":-3}}}}`},
+		{name: "malformed limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":"10"}}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := providerModelMaxPromptImagesFromRaw(json.RawMessage(tc.raw)); got != tc.want {
+				t.Fatalf("providerModelMaxPromptImagesFromRaw(%s) = %d, want %d", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// From the live catalog to the wire: a Google model's declared limit trims an Anthropic
+// transcript's oldest tool-result image, while another vendor's declared limit is ignored.
+func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
+	var mu sync.Mutex
+	sent := map[string][]byte{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"gemini-test","vendor":"Google","supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"vision":{"max_prompt_images":2}}}},
+				{"id":"gpt-test","vendor":"OpenAI","supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"vision":{"max_prompt_images":1}}}}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == providerEndpointChatCompletions:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			sent[extractRequestModel(body)] = body
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, chunk := range []string{
+				`{"id":"chat","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"compared"},"finish_reason":null}]}`,
+				`{"id":"chat","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			} {
+				_, _ = io.WriteString(w, "data: "+chunk+"\n\n")
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	image := func(n int) string {
+		return fmt.Sprintf(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG%d"}}`, n)
+	}
+	for _, model := range []string{"gemini-test", "gpt-test"} {
+		body := `{"model":"` + model + `","max_tokens":64,"messages":[
+			{"role":"user","content":"capture both"},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"toolu_1","name":"capture","input":{}},
+				{"type":"tool_use","id":"toolu_2","name":"capture","input":{}}]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[` + image(1) + `]},
+				{"type":"tool_result","tool_use_id":"toolu_2","content":[` + image(2) + `]}]},
+			{"role":"user","content":[` + image(3) + `,{"type":"text","text":"compare them"}]}],
+			"tools":[{"name":"capture","input_schema":{"type":"object"}}]}`
+		rec := httptest.NewRecorder()
+		h.HandleAnthropicMessages(rec, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d body = %s", model, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	const placeholder = "[image omitted: the model accepts at most 2 images per request]"
+	gemini, gpt := string(sent["gemini-test"]), string(sent["gpt-test"])
+	if strings.Contains(gemini, "base64,IMG1") || !strings.Contains(gemini, "base64,IMG2") || !strings.Contains(gemini, "base64,IMG3") || !strings.Contains(gemini, placeholder) {
+		t.Fatalf("Google request did not keep exactly the newest two images: %s", gemini)
+	}
+	if strings.Count(gemini, `"type":"image_url"`) != 2 {
+		t.Fatalf("Google request carries %d images, want 2: %s", strings.Count(gemini, `"type":"image_url"`), gemini)
+	}
+	for _, n := range []int{1, 2, 3} {
+		if !strings.Contains(gpt, fmt.Sprintf("base64,IMG%d", n)) {
+			t.Fatalf("another vendor's declared limit dropped image %d: %s", n, gpt)
+		}
+	}
+	if strings.Contains(gpt, "image omitted") {
+		t.Fatalf("another vendor's declared limit inserted a placeholder: %s", gpt)
 	}
 }
