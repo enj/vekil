@@ -1741,14 +1741,14 @@ func chatContentSummary(t *testing.T, body []byte) [][]string {
 	return summary
 }
 
-func TestApplyProviderModelRequestPolicy_OmitsOldestImagesBeyondLimit(t *testing.T) {
+func TestOmitChatImagesBeyondOwnerLimit_KeepsNewestImages(t *testing.T) {
 	body := []byte(`{"model":"gemini-test","messages":[` +
 		`{"role":"user","content":[{"type":"text","text":"first"},` + chatImagePart(1) + `]},` +
 		`{"role":"assistant","content":"looking"},` +
 		`{"role":"user","content":[` + chatImagePart(2) + `,` + chatImagePart(3) + `,{"type":"text","text":"latest"}]}]}`)
-	owner := providerModel{maxPromptImages: 2}
+	owners := []providerModel{{maxPromptImages: 2}}
 
-	got := chatContentSummary(t, applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, owner))
+	got := chatContentSummary(t, omitChatImagesBeyondOwnerLimit(body, providerEndpointChatCompletions, owners))
 	want := [][]string{
 		{"first", "[image omitted: the model accepts at most 2 images per request]"},
 		{"looking"},
@@ -1759,9 +1759,10 @@ func TestApplyProviderModelRequestPolicy_OmitsOldestImagesBeyondLimit(t *testing
 	}
 
 	for name, unchanged := range map[string][]byte{
-		"Responses":    applyProviderModelRequestPolicy(body, providerEndpointResponses, owner),
-		"no limit":     applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{}),
-		"within limit": applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{maxPromptImages: 3}),
+		"Responses":    omitChatImagesBeyondOwnerLimit(body, providerEndpointResponses, owners),
+		"no owner":     omitChatImagesBeyondOwnerLimit(body, providerEndpointChatCompletions, nil),
+		"no limit":     omitChatImagesBeyondOwnerLimit(body, providerEndpointChatCompletions, []providerModel{{}}),
+		"within limit": omitChatImagesBeyondOwnerLimit(body, providerEndpointChatCompletions, []providerModel{{maxPromptImages: 3}}),
 	} {
 		if string(unchanged) != string(body) {
 			t.Fatalf("%s: body changed to %s, want original %s", name, unchanged, body)
@@ -1793,6 +1794,8 @@ func TestProviderModelMaxPromptImagesFromRawHonorsOnlyGoogle(t *testing.T) {
 
 // From the live catalog to the wire: a Google model's declared limit trims an Anthropic
 // transcript's oldest tool-result image, while another vendor's declared limit is ignored.
+// Claude Code marks cache breakpoints, so the trim must also survive the cache mapping, which
+// refuses any change to the non-tool content it projects.
 func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
 	var mu sync.Mutex
 	sent := map[string][]byte{}
@@ -1835,7 +1838,9 @@ func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
 		return fmt.Sprintf(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG%d"}}`, n)
 	}
 	for _, model := range []string{"gemini-test", "gpt-test"} {
-		body := `{"model":"` + model + `","max_tokens":64,"messages":[
+		body := `{"model":"` + model + `","max_tokens":64,
+			"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}],
+			"messages":[
 			{"role":"user","content":"capture both"},
 			{"role":"assistant","content":[
 				{"type":"tool_use","id":"toolu_1","name":"capture","input":{}},
@@ -1843,7 +1848,7 @@ func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
 			{"role":"user","content":[
 				{"type":"tool_result","tool_use_id":"toolu_1","content":[` + image(1) + `]},
 				{"type":"tool_result","tool_use_id":"toolu_2","content":[` + image(2) + `]}]},
-			{"role":"user","content":[` + image(3) + `,{"type":"text","text":"compare them"}]}],
+			{"role":"user","content":[` + image(3) + `,{"type":"text","text":"compare them","cache_control":{"type":"ephemeral"}}]}],
 			"tools":[{"name":"capture","input_schema":{"type":"object"}}]}`
 		rec := httptest.NewRecorder()
 		h.HandleAnthropicMessages(rec, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body)))
@@ -1869,5 +1874,10 @@ func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
 	}
 	if strings.Contains(gpt, "image omitted") {
 		t.Fatalf("another vendor's declared limit inserted a placeholder: %s", gpt)
+	}
+	for model, body := range map[string]string{"gemini-test": gemini, "gpt-test": gpt} {
+		if !strings.Contains(body, `"copilot_cache_control"`) {
+			t.Fatalf("%s lost the client's cache breakpoints: %s", model, body)
+		}
 	}
 }

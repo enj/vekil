@@ -2741,6 +2741,8 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
+	// After the cache mapping, which refuses any change to non-tool content it projects.
+	body = omitChatImagesBeyondOwnerLimit(body, path, owners)
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
 		// Inference retries reserve every physical send explicitly. Disable the

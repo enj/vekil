@@ -269,11 +269,7 @@ func prepareResolvedProviderRequestBodyWithValidation(
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
 	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
 	dropStopSequences := endpoint == providerEndpointChatCompletions && owner.dropStopSequences
-	// Every image part spells image_url at least once, so a body at or under the limit
-	// skips decoding its messages.
-	limitImages := endpoint == providerEndpointChatCompletions && owner.maxPromptImages > 0 &&
-		bytes.Count(body, []byte("image_url")) > owner.maxPromptImages
-	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && !limitImages && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
+	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
 		return body
 	}
 	var payload map[string]json.RawMessage
@@ -311,15 +307,37 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 			changed = true
 		}
 	}
-	if limitImages {
-		if messages, omitted := omitOldestChatImages(payload["messages"], owner.maxPromptImages); omitted > 0 {
-			payload["messages"] = messages
-			changed = true
-		}
-	}
 	if !changed {
 		return body
 	}
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
+// omitChatImagesBeyondOwnerLimit enforces the owner's per-request image limit on a native
+// Chat body that is otherwise final.
+func omitChatImagesBeyondOwnerLimit(body []byte, path string, owners []providerModel) []byte {
+	if path != providerEndpointChatCompletions || len(owners) == 0 {
+		return body
+	}
+	limit := owners[0].maxPromptImages
+	// Every image part spells image_url at least once, so a body at or under the limit
+	// skips decoding its messages.
+	if limit <= 0 || bytes.Count(body, []byte("image_url")) <= limit {
+		return body
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	messages, omitted := omitOldestChatImages(payload["messages"], limit)
+	if omitted == 0 {
+		return body
+	}
+	payload["messages"] = messages
 	rewritten, err := json.Marshal(payload)
 	if err != nil {
 		return body
