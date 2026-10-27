@@ -1770,10 +1770,115 @@ func TestOmitChatImagesBeyondOwnerLimit_KeepsNewestImages(t *testing.T) {
 			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
 		"repeated messages key": {[]byte(`{"messages":[],"messages":[{"role":"user","content":[` +
 			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+
+		"escaped repeated messages key": {[]byte(`{"mess\u0061ges":[],"messages":[{"role":"user","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+		"escaped repeated content key": {[]byte(`{"messages":[{"role":"user","cont\u0065nt":"shadow","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+		"escaped repeated type key": {[]byte(`{"messages":[{"role":"user","content":[{"type":"text","t\u0079pe":"image_url","image_url":{"url":"first"}},` +
+			chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+		"escaped key within limit": {[]byte(`{"mess\u0061ges":[{"role":"user","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `]}]}`), providerEndpointChatCompletions, owners},
+		"invalid escaped key": {[]byte(`{"mess\uZZZZges":[{"role":"user","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
 	} {
 		if unchanged, omitted := omitChatImagesBeyondOwnerLimit(tc.body, tc.path, tc.owners); omitted != 0 || string(unchanged) != string(tc.body) {
 			t.Fatalf("%s: body changed to %s (omitted %d), want original %s", name, unchanged, omitted, tc.body)
 		}
+	}
+}
+
+func TestHandleOpenAIChatCompletionsHonorsGoogleCatalogImageLimitEscapedJSON(t *testing.T) {
+	first, second, third := chatImagePart(1), chatImagePart(2), chatImagePart(3)
+	for _, tc := range []struct {
+		name          string
+		messagesKey   string
+		contentKey    string
+		prefix        string
+		first, second string
+	}{
+		{name: "literal control", first: first, second: second},
+		{name: "escaped image types", first: strings.Replace(first, `"type":"image_url"`, `"type":"image\u005furl"`, 1), second: strings.Replace(second, `"type":"image_url"`, `"type":"image\u005furl"`, 1)},
+		{name: "escaped image key", first: strings.Replace(first, `"image_url":`, `"image\u005furl":`, 1), second: second},
+		{name: "escaped type key", first: strings.Replace(first, `"type":`, `"t\u0079pe":`, 1), second: second},
+		{name: "escaped messages key", messagesKey: `"mess\u0061ges"`, first: first, second: second},
+		{name: "escaped content key", contentKey: `"cont\u0065nt"`, first: first, second: second},
+		{name: "escaped unrelated key", prefix: `"m\u0065tadata":{"note":"keep <b>&</b>"},`, first: first, second: second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent atomic.Value
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
+					_, _ = io.WriteString(w, `{"data":[{"id":"gemini-test","vendor":"Google","supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"vision":{"max_prompt_images":2}}}}]}`)
+				case r.Method == http.MethodPost && r.URL.Path == providerEndpointChatCompletions:
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					sent.Store(body)
+					var request struct {
+						Messages []struct {
+							Content []struct {
+								Type string `json:"type"`
+							} `json:"content"`
+						} `json:"messages"`
+					}
+					if err := json.Unmarshal(body, &request); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					images := 0
+					for _, message := range request.Messages {
+						for _, part := range message.Content {
+							if part.Type == "image_url" {
+								images++
+							}
+						}
+					}
+					if images > 2 {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = fmt.Fprintf(w, `{"error":{"message":"too many images: maximum allowed is 2, got %d","type":"invalid_request_error"}}`, images)
+						return
+					}
+					_, _ = io.WriteString(w, `{"id":"chat-test","object":"chat.completion","created":1,"model":"gemini-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), nil, WithCopilotBaseURL(upstream.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			messagesKey, contentKey := tc.messagesKey, tc.contentKey
+			if messagesKey == "" {
+				messagesKey = `"messages"`
+			}
+			if contentKey == "" {
+				contentKey = `"content"`
+			}
+			body := "{\n  \"model\" : \"gemini-test\", " + tc.prefix + messagesKey + `:[{"role":"user",` + contentKey + ":[\n  " + tc.first + ",\n  " + tc.second + ",\n  " + third + "\n]}]}"
+			rec := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions, strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+			}
+			got, _ := sent.Load().([]byte)
+			const placeholder = `{"type":"text","text":"[image omitted: the model accepts at most 2 images per request]"}`
+			if want := strings.Replace(body, tc.first, placeholder, 1); string(got) != want {
+				t.Fatalf("upstream body = %s, want only the oldest image replaced: %s", got, want)
+			}
+			want := [][]string{{"[image omitted: the model accepts at most 2 images per request]", "data:image/png;base64,IMG2", "data:image/png;base64,IMG3"}}
+			if summary := chatContentSummary(t, got); !reflect.DeepEqual(summary, want) {
+				t.Fatalf("upstream content = %q, want %q", summary, want)
+			}
+		})
 	}
 }
 

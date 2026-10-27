@@ -326,9 +326,9 @@ func omitChatImagesBeyondOwnerLimit(body []byte, path string, owners []providerM
 		return body, 0
 	}
 	limit := owners[0].maxPromptImages
-	// A plainly spelled image part contains image_url twice, as its type and as its key, so a
-	// body with at most twice the limit cannot exceed it; an escaped spelling can at worst skip a trim.
-	if limit <= 0 || bytes.Count(body, []byte("image_url")) <= 2*limit {
+	// A plainly spelled image part contains image_url twice, as its type and as its key.
+	// Unicode escapes can hide either occurrence, so only use the literal count without them.
+	if limit <= 0 || (bytes.Count(body, []byte("image_url")) <= 2*limit && !bytes.Contains(body, []byte(`\u`))) {
 		return body, 0
 	}
 	images, ok := chatImagePartRanges(body)
@@ -353,7 +353,7 @@ type chatImagePartRange struct {
 }
 
 // chatImagePartRanges returns the byte ranges of a Chat body's image_url content parts in
-// message order. Keys match exactly, as the Chat wire format spells them. A body that repeats
+// message order. Keys match exactly after decoding JSON escapes. A body that repeats
 // messages, a message that repeats content or a part that repeats type is ambiguous to
 // upstream parsers, so it is reported unparsed rather than guessed at.
 func chatImagePartRanges(body []byte) ([]chatImagePartRange, bool) {
@@ -417,7 +417,7 @@ func uniqueRawJSONObjectField(body []byte, start, end int, key string) (valueSta
 	for {
 		name, fieldStart, fieldEnd, done, ok := object.next()
 		if !ok {
-			return 0, 0, false, false
+			return uniqueRawJSONObjectFieldWithEscapes(body, start, end, key)
 		}
 		if done {
 			return valueStart, valueEnd, found, true
@@ -429,6 +429,40 @@ func uniqueRawJSONObjectField(body []byte, start, end int, key string) (valueSta
 			valueStart, valueEnd, found = start+fieldStart, start+fieldEnd, true
 		}
 	}
+}
+
+// uniqueRawJSONObjectFieldWithEscapes is the semantic fallback for escaped object keys.
+// Decoder offsets retain the original value ranges without re-encoding the request.
+func uniqueRawJSONObjectFieldWithEscapes(body []byte, start, end int, key string) (valueStart, valueEnd int, found, ok bool) {
+	decoder := json.NewDecoder(bytes.NewReader(body[start:end]))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return 0, 0, false, false
+	}
+	for decoder.More() {
+		name, err := decoder.Token()
+		if err != nil {
+			return 0, 0, false, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return 0, 0, false, false
+		}
+		if name == key {
+			if found {
+				return 0, 0, false, false
+			}
+			valueEnd = start + int(decoder.InputOffset())
+			valueStart, found = valueEnd-len(value), true
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return 0, 0, false, false
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF {
+		return 0, 0, false, false
+	}
+	return valueStart, valueEnd, found, true
 }
 
 // rawJSONStringIs reports whether raw is a JSON string equal to want, decoding escapes only
