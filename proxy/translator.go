@@ -686,6 +686,11 @@ func extractToolResultContent(raw json.RawMessage, result int) (string, []models
 // validBase64ImageData reports whether data is standard padded base64, as
 // base64.StdEncoding.DecodeString would, while streaming the decode into io.Discard.
 func validBase64ImageData(data string) bool {
+	// NewDecoder can resume decoding after padding at a read boundary.
+	// Only padding and CR/LF may follow the first '='.
+	if padding := strings.IndexByte(data, '='); padding >= 0 && strings.Trim(data[padding:], "=\r\n") != "" {
+		return false
+	}
 	_, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)))
 	return err == nil
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -903,6 +904,38 @@ func TestAnthropicToolImagePolicyRejectsMediaBeforeClassifierOrTerminal(t *testi
 	}
 }
 
+func TestValidBase64ImageDataMatchesStandardEncoding(t *testing.T) {
+	for _, prefixBlocks := range []int{0, 254, 255, 256, 511} {
+		prefix := strings.Repeat("AAAA", prefixBlocks)
+		for _, test := range []struct {
+			name   string
+			suffix string
+		}{
+			{name: "complete quantum", suffix: "QUJD"},
+			{name: "one padding byte", suffix: "QUI="},
+			{name: "two padding bytes", suffix: "QQ=="},
+			{name: "newlines in padding", suffix: "QQ=\r\n="},
+			{name: "trailing newlines", suffix: "QQ==\r\n"},
+			{name: "data after one padding byte", suffix: "QUI=Qg=="},
+			{name: "data after two padding bytes", suffix: "QQ==Qg=="},
+			{name: "unpadded data after padding", suffix: "QQ==QUJD"},
+			{name: "data after padding and newlines", suffix: "QQ==\r\nQg=="},
+			{name: "extra padding", suffix: "QQ==="},
+			{name: "extra padding after newlines", suffix: "QQ==\r\n="},
+			{name: "missing padding", suffix: "QQ="},
+		} {
+			t.Run(fmt.Sprintf("prefix=%d/%s", prefixBlocks, test.name), func(t *testing.T) {
+				data := prefix + test.suffix
+				_, err := base64.StdEncoding.DecodeString(data)
+				want := err == nil
+				if got := validBase64ImageData(data); got != want {
+					t.Fatalf("validBase64ImageData = %v, want %v (DecodeString error: %v)", got, want, err)
+				}
+			})
+		}
+	}
+}
+
 func TestAnthropicToolImageMalformedContentFailsBeforeDispatch(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -914,6 +947,7 @@ func TestAnthropicToolImageMalformedContentFailsBeforeDispatch(t *testing.T) {
 		{name: "future block", content: []any{map[string]any{"type": "future_media"}}, cause: `unsupported tool_result content block type "future_media"`},
 		{name: "missing image source", content: []any{map[string]any{"type": "image"}}, cause: "image content block is missing source"},
 		{name: "bad base64", content: []any{map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "not-base64!"}}}, cause: "tool_result image requires an HTTP(S) URL or valid base64 image data"},
+		{name: "base64 data after padded chunk", content: []any{map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": strings.Repeat("AAAA", 255) + "QQ==Qg=="}}}, cause: "tool_result image requires an HTTP(S) URL or valid base64 image data"},
 		{name: "non HTTP URL", content: []any{toolImageContractURL("ftp://images.invalid/a.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
 		{name: "file URL", content: []any{toolImageContractURL("file:///tmp/a.png")}, cause: "tool_result url image source requires an HTTP(S) URL"},
 		{name: "relative URL", content: []any{toolImageContractURL("/frames/a.png?frame=1")}, cause: "tool_result url image source requires an HTTP(S) URL"},
